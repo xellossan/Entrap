@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Moraff's Entrap VR &amp; Desktop — First-Person P2P Tactical Puzzle</title>
+  <!-- Tailwind CSS v3.4.17 -->
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <!-- Three.js r128 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- PeerJS v1.5.4 for WebRTC P2P Data & Direct Voice Chat -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="bg-slate-950 text-slate-100 select-none overflow-hidden">
+
+  <!-- 3D WebGL / WebXR Viewport Container -->
+  <div id="game-canvas-container"></div>
+
+  <!-- Center First-Person Target Crosshair & Action Readout -->
+  <div id="crosshair-overlay">
+    <div id="reticle-ring-el" class="reticle-ring"></div>
+    <div id="reticle-label-el" class="mono-font text-[11px] px-2.5 py-0.5 rounded bg-slate-950/85 text-cyan-300 border border-cyan-500/30 shadow">
+      Aim at Grid Square or Sky GUI
+    </div>
+  </div>
+
+  <!-- Top Telemetry, Level Select & Voice Chat HUD Bar -->
+  <header class="fixed top-2 left-2 right-2 z-20 flex flex-wrap items-center justify-between gap-2 pointer-events-none">
+    <!-- Left Telemetry Pill -->
+    <div class="cyber-panel rounded-xl px-3.5 py-2 flex flex-wrap items-center gap-3 md:gap-4 pointer-events-auto">
+      <div class="flex items-center gap-2">
+        <span class="inline-block w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></span>
+        <span class="font-bold tracking-wider text-xs md:text-sm text-cyan-300 uppercase">Moraff's Entrap 3D</span>
+        <span id="hud-platform-badge" class="text-[11px] font-semibold px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-400/30">
+          Desktop Mode
+        </span>
+      </div>
+      <div class="flex items-center gap-3 text-xs mono-font">
+        <div class="flex items-center gap-1.5">
+          <span class="text-slate-400">LVL:</span>
+          <strong id="hud-level" class="text-white">1 / 10</strong>
+          <select id="hud-level-select" class="bg-slate-900 text-cyan-300 border border-cyan-500/40 rounded px-1.5 py-0.5 text-[11px] font-bold focus:outline-none">
+            <option value="1">Lvl 1</option>
+            <option value="2">Lvl 2</option>
+            <option value="3">Lvl 3</option>
+            <option value="4">Lvl 4</option>
+            <option value="5">Lvl 5</option>
+            <option value="6">Lvl 6</option>
+            <option value="7">Lvl 7</option>
+            <option value="8">Lvl 8</option>
+            <option value="9">Lvl 9</option>
+            <option value="10">Lvl 10</option>
+          </select>
+        </div>
+        <div><span class="text-slate-400">TURNS:</span> <strong id="hud-turns" class="text-cyan-300">0</strong></div>
+        <div><span class="text-slate-400">FOES:</span> <strong id="hud-monsters" class="text-rose-400">4</strong></div>
+        <div><span class="text-slate-400">GOAL DIST:</span> <strong id="hud-distance" class="text-emerald-300">17 sq</strong></div>
+        <div class="hidden sm:block"><span class="text-slate-400">ROLE:</span> <strong id="hud-role" class="text-sky-300">P1 (South → North)</strong></div>
+      </div>
+    </div>
+
+    <!-- Right P2P Network, Voice Chat & Menu Controls -->
+    <div class="cyber-panel rounded-xl px-3 py-2 flex flex-wrap items-center gap-2 pointer-events-auto">
+      <div class="flex flex-col text-right mr-1">
+        <span id="hud-net-status" class="text-[11px] font-medium text-cyan-200">Offline (Single Player)</span>
+        <div class="flex items-center justify-end gap-1.5">
+          <span id="hud-voice-status" class="text-[11px] font-semibold text-amber-300">Voice Inactive</span>
+          <div class="w-12 h-1.5 bg-slate-800 rounded-full overflow-hidden border border-slate-700" title="Live Mic Audio Level">
+            <div id="mic-level-bar" class="h-full bg-emerald-400 transition-all duration-75" style="width: 0%;"></div>
+          </div>
+        </div>
+      </div>
+
+      <button id="btn-toggle-mic" type="button" class="cyber-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+        Enable / Mute Mic
+      </button>
+      <button id="btn-toggle-sfx" type="button" class="cyber-btn px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-200 border border-slate-600">
+        SFX: On
+      </button>
+      <button id="btn-restart-level" type="button" class="cyber-btn px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/40">
+        Restart Level
+      </button>
+      <button id="btn-download-zip-hud" type="button" class="cyber-btn px-2.5 py-1.5 rounded-lg text-xs font-bold bg-emerald-500 text-slate-950 border border-emerald-400">
+        ⬇ Download ZIP
+      </button>
+      <button id="btn-back-menu" type="button" class="cyber-btn px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500/20 text-cyan-200 border border-cyan-500/40">
+        Start Menu
+      </button>
+    </div>
+  </header>
+
+  <!-- Toast Notification Banner -->
+  <div id="toast-banner" class="hidden fixed top-16 left-1/2 -translate-x-1/2 z-30 cyber-panel px-4 py-2 rounded-full text-xs md:text-sm font-medium text-cyan-200 border border-cyan-400/50 shadow-lg pointer-events-none">
+    Status Message
+  </div>
+
+  <!-- Bottom HUD: Overhead Minimap Radar (Left) & Single-Click Tactical Controls (Right) -->
+  <div class="fixed bottom-3 left-3 right-3 z-20 flex items-end justify-between pointer-events-none gap-3">
+    <!-- Moraff's Entrap Overhead Radar Minimap -->
+    <div class="cyber-panel rounded-xl p-2.5 pointer-events-auto flex flex-col items-center">
+      <div class="w-full flex items-center justify-between text-[10px] mono-font text-slate-300 mb-1 px-0.5">
+        <span class="text-cyan-300 font-bold">NORTH GOAL (P1)</span>
+        <span>RADAR</span>
+      </div>
+      <canvas id="minimap-canvas" width="143" height="209" class="rounded border border-slate-700 bg-slate-950"></canvas>
+      <div class="w-full flex items-center justify-between text-[10px] mono-font text-slate-300 mt-1 px-0.5">
+        <span class="text-pink-400 font-bold">SOUTH GOAL (P2)</span>
+        <span>21×33</span>
+      </div>
+    </div>
+
+    <!-- Interactive On-Screen Tactical Controls (Single Unified Toggle Button + Step Pad) -->
+    <div class="cyber-panel rounded-xl p-3 pointer-events-auto flex flex-col sm:flex-row items-center gap-3">
+      <!-- Single Unified Floor Toggle Action Button (Plus compatibility hidden aliases if needed) -->
+      <div class="flex flex-col gap-1.5">
+        <div class="text-[10px] uppercase tracking-wider text-slate-300 font-semibold text-center">
+          One-Click Floor Toggle (1 Turn)
+        </div>
+        <button id="btn-action-toggle" type="button" class="cyber-btn px-3.5 py-2.5 rounded-xl text-xs font-bold bg-gradient-to-r from-emerald-500/30 via-cyan-500/30 to-rose-500/30 text-white border border-cyan-400/60 flex flex-col items-center gap-1 shadow-md">
+          <span>TOGGLE TARGET SQUARE</span>
+          <span class="mono-font text-[10px] px-2 py-0.5 rounded bg-slate-950/90 text-cyan-300">
+            Click / Trigger: Create if Empty • Delete if Floor
+          </span>
+        </button>
+        <div class="hidden">
+          <button id="btn-action-delete" type="button">Delete</button>
+          <button id="btn-action-create" type="button">Create</button>
+        </div>
+      </div>
+
+      <!-- Directional Step & Turn Pad -->
+      <div class="grid grid-cols-3 gap-1.5 text-xs font-bold mono-font">
+        <button id="pad-rot-left" type="button" class="cyber-btn w-10 h-9 rounded bg-slate-800/90 hover:bg-slate-700 text-cyan-300 border border-slate-600" title="Rotate Left (Q / Right Stick)">↶ Q</button>
+        <button id="pad-up" type="button" class="cyber-btn w-10 h-9 rounded bg-cyan-500/25 hover:bg-cyan-500/40 text-white border border-cyan-400/50" title="Step Forward (W / Left Stick)">▲ W</button>
+        <button id="pad-rot-right" type="button" class="cyber-btn w-10 h-9 rounded bg-slate-800/90 hover:bg-slate-700 text-cyan-300 border border-slate-600" title="Rotate Right (E / Right Stick)">E ↷</button>
+
+        <button id="pad-left" type="button" class="cyber-btn w-10 h-9 rounded bg-cyan-500/25 hover:bg-cyan-500/40 text-white border border-cyan-400/50" title="Strafe Left (A / Left Stick)">◀ A</button>
+        <button id="pad-down" type="button" class="cyber-btn w-10 h-9 rounded bg-cyan-500/25 hover:bg-cyan-500/40 text-white border border-cyan-400/50" title="Step Back (S / Left Stick)">▼ S</button>
+        <button id="pad-right" type="button" class="cyber-btn w-10 h-9 rounded bg-cyan-500/25 hover:bg-cyan-500/40 text-white border border-cyan-400/50" title="Strafe Right (D / Left Stick)">D ▶</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       START SCREEN / LOBBY MODAL (Select VR vs Desktop, Room Xellossan, Mode)
+       ======================================================================== -->
+  <div id="start-modal" class="fixed inset-0 z-40 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md overflow-y-auto">
+    <div class="cyber-panel rounded-2xl max-w-2xl w-full p-5 md:p-7 border border-cyan-400/40 my-auto">
+      <!-- Header -->
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-4 mb-5">
+        <div>
+          <span class="text-[11px] font-bold uppercase tracking-widest text-cyan-400 block">1990 DOS Rainbow Grid Classic in First-Person 3D</span>
+          <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight text-white">
+            MORAFF'S ENTRAP <span class="text-cyan-400">VR &amp; DESKTOP</span>
+          </h1>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <button id="btn-download-zip-modal" type="button" class="cyber-btn px-3.5 py-1.5 rounded-full text-xs font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg flex items-center gap-1.5">
+            ⬇ Download Web Server ZIP (moraffs_entrap_vr.zip)
+          </button>
+          <span id="xr-support-badge" class="text-xs font-medium px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40">
+            Checking Oculus Quest WebXR...
+          </span>
+        </div>
+      </div>
+
+      <!-- STEP 1: Select VR vs Desktop Mode BEFORE Starting or Joining -->
+      <div class="mb-5">
+        <label class="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">
+          1. Select Platform Mode (Before Starting or Joining Game)
+        </label>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button id="btn-mode-desktop" type="button" class="cyber-btn mode-card-active text-left p-3.5 rounded-xl border border-slate-700 bg-slate-900/75 flex flex-col justify-between">
+            <div class="flex items-center justify-between mb-1">
+              <span class="font-bold text-sm text-white">Desktop Browser Mode</span>
+              <span class="text-[11px] mono-font px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300">Keyboard + Mouse</span>
+            </div>
+            <p class="text-xs text-slate-300 leading-relaxed">
+              Move with <strong>WASD</strong>, rotate with <strong>Mouse / Q &amp; E</strong>. <strong>Click</strong> any grid square to toggle it (deletes existing rainbow floor, or creates floor in a black pit).
+            </p>
+          </button>
+
+          <button id="btn-mode-vr" type="button" class="cyber-btn text-left p-3.5 rounded-xl border border-slate-700 bg-slate-900/75 flex flex-col justify-between">
+            <div class="flex items-center justify-between mb-1">
+              <span class="font-bold text-sm text-white">Oculus Quest VR Mode</span>
+              <span class="text-[11px] mono-font px-2 py-0.5 rounded bg-fuchsia-500/20 text-fuchsia-300">WebXR + Sky GUI</span>
+            </div>
+            <p class="text-xs text-slate-300 leading-relaxed">
+              <strong>Left Thumbstick</strong> moves; <strong>Right Thumbstick</strong> rotates. Pull <strong>Trigger</strong> to toggle floor/pit squares or click the <strong>Floating Sky GUI</strong> to switch levels or restart anytime.
+            </p>
+          </button>
+        </div>
+      </div>
+
+      <!-- STEP 2: P2P Multiplayer Room Configuration & Starting Level -->
+      <div class="mb-5 p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+          <label for="room-name-input" class="text-xs font-bold uppercase tracking-wider text-cyan-300">
+            2. Peer-to-Peer Room Name, Starting Level &amp; Direct Voice Chat
+          </label>
+          <span class="text-[11px] text-emerald-300 font-medium">● WebRTC Direct P2P Audio + Data Enabled</span>
+        </div>
+        <div class="flex flex-col sm:flex-row gap-2.5">
+          <input
+            id="room-name-input"
+            type="text"
+            value="Xellossan"
+            placeholder="Enter Room Name (Default: Xellossan)"
+            class="mono-font flex-1 px-3.5 py-2 rounded-lg bg-slate-950 border border-cyan-500/40 text-white text-sm focus:outline-none focus:border-cyan-400"
+          />
+          <select id="start-level-select" class="mono-font px-3 py-2 rounded-lg bg-slate-950 border border-cyan-500/40 text-cyan-300 text-sm font-bold focus:outline-none">
+            <option value="1">Start Level 1</option>
+            <option value="2">Start Level 2</option>
+            <option value="3">Start Level 3</option>
+            <option value="4">Start Level 4</option>
+            <option value="5">Start Level 5</option>
+            <option value="6">Start Level 6</option>
+            <option value="7">Start Level 7</option>
+            <option value="8">Start Level 8</option>
+            <option value="9">Start Level 9</option>
+            <option value="10">Start Level 10</option>
+          </select>
+        </div>
+        <p class="text-[11px] text-slate-400 mt-2 leading-relaxed">
+          In 2-Player Multiplayer, <strong>Host (Player 1)</strong> starts on the South end and races North, while <strong>Joiner (Player 2)</strong> starts on the opposite North end and races South. Monsters fluidly pursue whichever player they are closer to!
+        </p>
+      </div>
+
+      <!-- STEP 3: Launch Single Player, Host Room, or Join Room -->
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+        <button id="btn-start-single" type="button" class="cyber-btn py-3 px-4 rounded-xl font-bold text-sm bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-lg">
+          ▶ Single Player
+        </button>
+        <button id="btn-start-host" type="button" class="cyber-btn py-3 px-4 rounded-xl font-bold text-sm bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg">
+          ★ Host / Create Room
+        </button>
+        <button id="btn-start-join" type="button" class="cyber-btn py-3 px-4 rounded-xl font-bold text-sm bg-fuchsia-500 hover:bg-fuchsia-400 text-white shadow-lg">
+          ⇄ Join Room
+        </button>
+      </div>
+
+      <!-- Rules & Mechanics Summary -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs text-slate-300 bg-slate-900/60 p-3.5 rounded-xl border border-slate-800/80">
+        <div>
+          <strong class="text-cyan-300 block mb-0.5">One-Click Floor Toggle</strong>
+          Click or Trigger any square: if a rainbow floor square exists, it is deleted into a black pit; if it's a black pit, a new rainbow floor square is created!
+        </div>
+        <div>
+          <strong class="text-emerald-300 block mb-0.5">Fluid Monster Pursuit</strong>
+          Random 3D monsters (Claw Lizards, Horned Imps, Cyclops Spiders, MutantBots) navigate around black pit clusters and fluidly glide 1 square per turn.
+        </div>
+        <div>
+          <strong class="text-rose-300 block mb-0.5">3D Sky GUI in VR</strong>
+          Look up into the sky at any time in VR or Desktop to click the floating <strong>Level 1–10 Selector</strong> and <strong>Restart Level</strong> billboards!
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       GAME OVER / LEVEL COMPLETE MODAL
+       ======================================================================== -->
+  <div id="gameover-modal" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
+    <div class="cyber-panel rounded-2xl max-w-md w-full p-6 text-center border border-cyan-400/40">
+      <h2 id="gameover-title" class="text-2xl md:text-3xl font-extrabold text-emerald-400 tracking-tight mb-2">
+        LEVEL CLEARED!
+      </h2>
+      <p id="gameover-desc" class="text-sm text-slate-300 mb-6 leading-relaxed">
+        You crossed the rainbow playing field without being touched by a monster!
+      </p>
+      <div class="flex flex-wrap items-center justify-center gap-3">
+        <button id="btn-retry-level" type="button" class="cyber-btn px-4 py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider bg-slate-800 hover:bg-slate-700 text-white border border-slate-600">
+          Replay Level
+        </button>
+        <button id="btn-next-level" type="button" class="cyber-btn px-5 py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider bg-emerald-500 hover:bg-emerald-400 text-slate-950">
+          Next Difficulty Level →
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Core Game Script -->
+  <script src="game.js"></script>
+</body>
+</html>

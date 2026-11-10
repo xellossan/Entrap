@@ -1,0 +1,10 @@
+{
+  "name": "Moraff's Entrap VR & Desktop Remake",
+  "short_name": "Entrap VR",
+  "description": "First-person WebXR Oculus Quest & Desktop Browser remake of Moraff's Entrap (1990) with 2-player P2P multiplayer and direct WebRTC voice chat.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#070913",
+  "theme_color": "#00f0ff",
+  "orientation": "landscape"
+}

@@ -1,0 +1,2261 @@
+/* ============================================================================
+ * Moraff's Entrap VR & Desktop Remake (WebXR + P2P Multiplayer + Voice Chat)
+ * Grounded Remake of Steve Moraff's 1990/1991 Turn-Based Tactical Grid Game
+ * ============================================================================ */
+
+const TILE_SIZE = 2.4;
+const GRID_W = 21;
+const GRID_H = 33;
+
+// Tile types
+const TILE_VOID = 0;      // Missing black square / pit (Click / Trigger creates rainbow floor)
+const TILE_FLOOR = 1;     // Rainbow gradient walkable square (Click / Trigger deletes into black pit)
+const TILE_GOAL_P1 = 2;   // North Goal Row (z = 0) - P1 target
+const TILE_GOAL_P2 = 3;   // South Goal Row (z = GRID_H - 1) - P2 target
+
+// Diverse 3D Monster Archetypes (Inspired by Moraff's Entrap yellow clawed lizard/imp sprites & creatures)
+const MONSTER_TYPES = [
+  { id: 'lizard', name: 'Claw Lizard', color: 0xeab308, accent: 0xef4444, emissive: 0x713f12, smarts: 2 },
+  { id: 'imp', name: 'Horned Imp', color: 0xf97316, accent: 0xfef08a, emissive: 0x7c2d12, smarts: 1 },
+  { id: 'arachnid', name: 'Cursed Arachnid', color: 0xa855f7, accent: 0x22d3ee, emissive: 0x4c1d95, smarts: 2 },
+  { id: 'golem', name: 'Mutant Stalker', color: 0x10b981, accent: 0xf43f5e, emissive: 0x064e3b, smarts: 3 }
+];
+
+// Application & Game State
+const state = {
+  platformMode: 'desktop',   // 'desktop' | 'vr'
+  gameMode: 'single',        // 'single' | 'host' | 'join'
+  roomName: 'Xellossan',
+  isRunning: false,
+  isGameOver: false,
+  winnerText: '',
+  gameOverReason: '',
+  level: 1,
+  maxLevels: 10,
+  turnCount: 0,
+  floorsCreated: 0,
+  floorsDeleted: 0,
+  monstersTrapped: 0,
+  soundMuted: false,
+
+  // Grid & Entities
+  grid: [],
+  players: {
+    p1: { id: 'p1', label: 'Player 1 (South→North)', x: 6, z: GRID_H - 2, yaw: 0, alive: true, color: 0x00f0ff },
+    p2: { id: 'p2', label: 'Player 2 (North→South)', x: 6, z: 1, yaw: Math.PI, alive: true, color: 0xff007f, active: false }
+  },
+  localPlayerKey: 'p1', // 'p1' for Single/Host, 'p2' for Client Joiner
+  monsters: [],
+
+  // Raycasted target grid cell or Sky GUI button
+  targetedCell: null, // { x, z, tileType, distanceGrid }
+  targetedSkyButton: null, // { action, level, label, mesh }
+
+  // Networking & Voice Chat
+  peer: null,
+  dataConn: null,
+  mediaCall: null,
+  localStream: null,
+  remoteAudioEl: null,
+  micMuted: false,
+  micVolumeLevel: 0,
+  netStatus: 'Offline (Single Player)',
+  voiceStatus: 'Voice Inactive',
+  webxrSupported: false,
+  vrSessionActive: false
+};
+
+// Web Audio API Synthesizer for Retro Sci-Fi Sound Effects
+class SoundEngine {
+  constructor() {
+    this.ctx = null;
+  }
+
+  init() {
+    if (!this.ctx) {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) this.ctx = new AudioCtx();
+    }
+    if (this.ctx && this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
+  }
+
+  playTone(freq, type, duration, gainVal = 0.12, slideFreq = null) {
+    if (state.soundMuted) return;
+    this.init();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, now);
+    if (slideFreq) {
+      osc.frequency.exponentialRampToValueAtTime(slideFreq, now + duration);
+    }
+    gain.gain.setValueAtTime(gainVal, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    osc.start(now);
+    osc.stop(now + duration);
+  }
+
+  step() {
+    this.playTone(220, 'triangle', 0.09, 0.12, 310);
+  }
+
+  createFloor() {
+    this.playTone(340, 'sine', 0.16, 0.15, 680);
+  }
+
+  deleteFloor() {
+    this.playTone(420, 'sawtooth', 0.16, 0.12, 130);
+  }
+
+  monsterTrapped() {
+    this.playTone(580, 'square', 0.25, 0.14, 180);
+  }
+
+  uiClick() {
+    this.playTone(520, 'sine', 0.1, 0.14, 760);
+  }
+
+  victory() {
+    if (state.soundMuted) return;
+    const notes = [440, 554.37, 659.25, 880];
+    notes.forEach((n, idx) => {
+      setTimeout(() => this.playTone(n, 'triangle', 0.22, 0.16), idx * 110);
+    });
+  }
+
+  defeat() {
+    if (state.soundMuted) return;
+    const notes = [300, 250, 200, 120];
+    notes.forEach((n, idx) => {
+      setTimeout(() => this.playTone(n, 'sawtooth', 0.26, 0.16), idx * 120);
+    });
+  }
+}
+
+const sfx = new SoundEngine();
+
+// ============================================================================
+// Three.js Scene, Camera Rig, WebXR Controllers, Sky GUI, and World Objects
+// ============================================================================
+let scene, camera, renderer, cameraRig;
+let tileMeshes = [];               // 2D array [z][x] of floor/void meshes
+let monsterMeshes = new Map();     // Map<monsterId, THREE.Group> for fluid interpolation
+let p1AvatarMesh = null;
+let p2AvatarMesh = null;
+let targetHighlightMesh = null;
+let vrControllerLeft = null;
+let vrControllerRight = null;
+let vrLaserLeft = null;
+let vrLaserRight = null;
+let vrRadarCanvas = null;
+let vrRadarTexture = null;
+let vrWristwatchMesh = null;
+let vrHudMesh = null;
+let vrHudCanvas = null;
+let vrHudTexture = null;
+let raycaster = new THREE.Raycaster();
+let interactivePlaneMeshes = [];
+let skyGuiGroup = null;
+let skyGuiButtons = [];            // Interactive 3D buttons in the sky (Level 1..10, Restart, etc.)
+let skyHeaderMesh = null;
+let skyHeaderCanvas = null;
+let skyHeaderTexture = null;
+
+// Thumbstick edge-trigger state for VR
+const vrStickState = {
+  leftReady: true,
+  rightReady: true,
+  lastStepTime: 0
+};
+
+// ============================================================================
+// Initialization on Window Load
+// ============================================================================
+window.addEventListener('load', () => {
+  initThreeEngine();
+  checkWebXRSupport();
+  bindUIListeners();
+  generateLevelMap(1);
+  rebuild3DBoard();
+  updateSkyGUI();
+  updateHUD();
+  drawMinimap();
+  renderer.setAnimationLoop(renderLoop);
+});
+
+function initThreeEngine() {
+  const container = document.getElementById('game-canvas-container');
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x030511);
+
+  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 180);
+
+  // Camera Rig allows moving & rotating the player seamlessly in both Desktop and WebXR VR
+  cameraRig = new THREE.Group();
+  cameraRig.position.set(0, 0, 0);
+  camera.position.set(0, 1.65, 0);
+  cameraRig.add(camera);
+  scene.add(cameraRig);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.xr.enabled = true;
+  renderer.domElement.classList.add('webgl-canvas');
+  container.appendChild(renderer.domElement);
+
+  // Crisp, vibrant lighting to showcase the Moraff rainbow gradient tiles and 3D monsters
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.78);
+  scene.add(ambientLight);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.85);
+  dirLight.position.set(14, 35, 18);
+  scene.add(dirLight);
+
+  const backLight = new THREE.DirectionalLight(0x88ccff, 0.45);
+  backLight.position.set(-14, 25, -18);
+  scene.add(backLight);
+
+  // Classic Moraff deep blue wireframe background grid & starfield
+  createMoraffBackdrop();
+
+  // Target Selection Highlight Box
+  const hlGeo = new THREE.BoxGeometry(TILE_SIZE * 0.98, 0.36, TILE_SIZE * 0.98);
+  const hlMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.95
+  });
+  targetHighlightMesh = new THREE.Mesh(hlGeo, hlMat);
+  targetHighlightMesh.visible = false;
+  scene.add(targetHighlightMesh);
+
+  // Player Avatars (for seeing the other player in P2P multiplayer)
+  p1AvatarMesh = createPlayerAvatarMesh(0x00f0ff);
+  p2AvatarMesh = createPlayerAvatarMesh(0xff007f);
+  scene.add(p1AvatarMesh);
+  scene.add(p2AvatarMesh);
+
+  // Create Floating 3D Sky GUI for Level Selection (1-10) & Restart anytime in VR or Desktop
+  createFloatingSkyGUI();
+
+  // Setup WebXR Controllers (Unified Single-Trigger Toggle for Floor / Sky GUI)
+  setupWebXRControllers();
+
+  window.addEventListener('resize', onWindowResize);
+}
+
+function createMoraffBackdrop() {
+  // Deep blue grid plane beneath the pit layer so missing black squares contrast like the DOS screenshot
+  const gridHelper = new THREE.GridHelper(120, 60, 0x1d4ed8, 0x0f172a);
+  gridHelper.position.y = -2.2;
+  scene.add(gridHelper);
+
+  const starsGeo = new THREE.BufferGeometry();
+  const count = 400;
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    positions[i * 3] = (Math.random() - 0.5) * 130;
+    positions[i * 3 + 1] = Math.random() * 55 + 4;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 130;
+  }
+  starsGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const starsMat = new THREE.PointsMaterial({ color: 0x60a5fa, size: 0.25, transparent: true, opacity: 0.65 });
+  scene.add(new THREE.Points(starsGeo, starsMat));
+}
+
+// ============================================================================
+// Floating 3D Sky GUI (Clickable anytime in VR Mode or Desktop Mode)
+// ============================================================================
+function createFloatingSkyGUI() {
+  skyGuiGroup = new THREE.Group();
+  // Positioned floating above the cameraRig so the player can simply look up into the sky from anywhere on the map
+  skyGuiGroup.position.set(0, 7.2, 0);
+  cameraRig.add(skyGuiGroup);
+
+  skyGuiButtons = [];
+
+  // Create two mirrored sky control domes (North-facing and South-facing) so whichever way you face, looking up shows the GUI!
+  buildSkyPanelCluster(0, -8.5, 0);
+  buildSkyPanelCluster(0, 8.5, Math.PI);
+}
+
+function buildSkyPanelCluster(offsetX, offsetZ, rotY) {
+  const cluster = new THREE.Group();
+  cluster.position.set(offsetX, 0, offsetZ);
+  cluster.rotation.y = rotY;
+  // Tilt downward toward the player looking up at ~35 degrees
+  cluster.rotation.x = 0.52;
+
+  // Header Banner ("MORAFF'S ENTRAP VR SKY MENU — CLICK ANYTIME")
+  if (!skyHeaderCanvas) {
+    skyHeaderCanvas = document.createElement('canvas');
+    skyHeaderCanvas.width = 768;
+    skyHeaderCanvas.height = 128;
+    skyHeaderTexture = new THREE.CanvasTexture(skyHeaderCanvas);
+  }
+  const headerMat = new THREE.MeshBasicMaterial({ map: skyHeaderTexture, transparent: true, side: THREE.DoubleSide });
+  const headerMesh = new THREE.Mesh(new THREE.PlaneGeometry(7.6, 1.25), headerMat);
+  headerMesh.position.set(0, 1.75, 0);
+  cluster.add(headerMesh);
+
+  // Action Row: RESTART LEVEL, PREV LEVEL, NEXT LEVEL
+  const restartBtn = createSkyButtonMesh('⟳ RESTART LEVEL', 2.6, 0.78, '#f59e0b', '#0f172a', {
+    action: 'restart',
+    label: 'Sky GUI: Restart Current Level'
+  });
+  restartBtn.position.set(-2.5, 0.72, 0);
+  cluster.add(restartBtn);
+  skyGuiButtons.push(restartBtn);
+
+  const prevBtn = createSkyButtonMesh('◀ PREV LVL', 2.2, 0.78, '#38bdf8', '#0f172a', {
+    action: 'prev_level',
+    label: 'Sky GUI: Previous Level'
+  });
+  prevBtn.position.set(0.1, 0.72, 0);
+  cluster.add(prevBtn);
+  skyGuiButtons.push(prevBtn);
+
+  const nextBtn = createSkyButtonMesh('NEXT LVL ▶', 2.2, 0.78, '#10b981', '#0f172a', {
+    action: 'next_level',
+    label: 'Sky GUI: Next Level'
+  });
+  nextBtn.position.set(2.5, 0.72, 0);
+  cluster.add(nextBtn);
+  skyGuiButtons.push(nextBtn);
+
+  // Direct Level Select Buttons (Levels 1 to 10 in two neat rows of 5)
+  for (let lvl = 1; lvl <= 10; lvl++) {
+    const col = (lvl - 1) % 5;
+    const row = Math.floor((lvl - 1) / 5);
+    const hue = Math.round(((lvl - 1) / 10) * 320);
+    const bgHex = `hsl(${hue}, 85%, 52%)`;
+
+    const lvlBtn = createSkyButtonMesh(`LEVEL ${lvl}`, 1.38, 0.66, bgHex, '#090d16', {
+      action: 'select_level',
+      level: lvl,
+      label: `Sky GUI: Jump to Level ${lvl}`
+    });
+    lvlBtn.position.set((col - 2) * 1.52, -0.18 - row * 0.82, 0);
+    cluster.add(lvlBtn);
+    skyGuiButtons.push(lvlBtn);
+  }
+
+  skyGuiGroup.add(cluster);
+}
+
+function createSkyButtonMesh(text, width, height, borderColor, bgColor, userDataObj) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 112;
+  const tex = new THREE.CanvasTexture(canvas);
+
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide });
+  const geo = new THREE.PlaneGeometry(width, height);
+  const mesh = new THREE.Mesh(geo, mat);
+
+  mesh.userData = {
+    isSkyButton: true,
+    canvas,
+    tex,
+    text,
+    borderColor,
+    bgColor,
+    ...userDataObj
+  };
+
+  renderSkyButtonCanvas(mesh, false);
+  return mesh;
+}
+
+function renderSkyButtonCanvas(mesh, isHovered) {
+  const { canvas, tex, text, borderColor, level, action } = mesh.userData;
+  const ctx = canvas.getContext('2d');
+  const isCurrentLevel = (action === 'select_level' && level === state.level);
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = isHovered ? '#1e293b' : (isCurrentLevel ? '#0f3460' : 'rgba(9, 14, 28, 0.92)');
+  ctx.fillRect(4, 4, canvas.width - 8, canvas.height - 8);
+
+  ctx.lineWidth = isHovered || isCurrentLevel ? 8 : 5;
+  ctx.strokeStyle = isHovered ? '#ffffff' : (isCurrentLevel ? '#00ff88' : borderColor);
+  ctx.strokeRect(4, 4, canvas.width - 8, canvas.height - 8);
+
+  ctx.fillStyle = isHovered ? '#00ff88' : '#ffffff';
+  ctx.font = 'bold 30px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+  tex.needsUpdate = true;
+}
+
+function updateSkyGUI() {
+  if (skyHeaderCanvas && skyHeaderTexture) {
+    const ctx = skyHeaderCanvas.getContext('2d');
+    ctx.fillStyle = 'rgba(7, 11, 24, 0.92)';
+    ctx.fillRect(0, 0, 768, 128);
+
+    // Rainbow top & bottom trim
+    const grad = ctx.createLinearGradient(0, 0, 768, 0);
+    grad.addColorStop(0, '#ff0055');
+    grad.addColorStop(0.25, '#ffcc00');
+    grad.addColorStop(0.5, '#00ff66');
+    grad.addColorStop(0.75, '#00ccff');
+    grad.addColorStop(1, '#aa00ff');
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = 6;
+    ctx.strokeRect(3, 3, 762, 122);
+
+    ctx.fillStyle = '#00f0ff';
+    ctx.font = 'bold 28px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`MORAFF'S ENTRAP SKY GUI — LEVEL ${state.level} / 10`, 384, 48);
+
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '21px monospace';
+    ctx.fillText(`Turns: ${state.turnCount} | Monsters: ${state.monsters.length} | Point & Click/Trigger Anytime`, 384, 92);
+    skyHeaderTexture.needsUpdate = true;
+  }
+
+  skyGuiButtons.forEach(btn => {
+    renderSkyButtonCanvas(btn, state.targetedSkyButton && state.targetedSkyButton.mesh === btn);
+  });
+}
+
+function executeSkyButtonAction(btnData) {
+  if (!btnData) return;
+  sfx.uiClick();
+
+  if (btnData.action === 'restart') {
+    document.getElementById('gameover-modal').classList.add('hidden');
+    generateLevelMap(state.level);
+    rebuild3DBoard();
+    updateSkyGUI();
+    updateHUD();
+    drawMinimap();
+    showToast(`Restarted Level ${state.level}!`, 'cyan');
+    if (state.gameMode === 'host') broadcastFullStateToPeer();
+  } else if (btnData.action === 'prev_level') {
+    const targetLvl = Math.max(1, state.level - 1);
+    changeToLevel(targetLvl);
+  } else if (btnData.action === 'next_level') {
+    const targetLvl = Math.min(state.maxLevels, state.level + 1);
+    changeToLevel(targetLvl);
+  } else if (btnData.action === 'select_level' && btnData.level) {
+    changeToLevel(btnData.level);
+  }
+}
+
+function changeToLevel(newLevel) {
+  document.getElementById('gameover-modal').classList.add('hidden');
+  generateLevelMap(newLevel);
+  rebuild3DBoard();
+  updateSkyGUI();
+  updateHUD();
+  drawMinimap();
+  const lvlSel = document.getElementById('hud-level-select');
+  if (lvlSel) lvlSel.value = String(state.level);
+  showToast(`Loaded Difficulty Level ${state.level}!`, 'emerald');
+  if (state.gameMode === 'host') broadcastFullStateToPeer();
+}
+
+// ============================================================================
+// Distinct 3D Monster Models (Claw Lizard, Horned Imp, Cursed Arachnid, Mutant)
+// ============================================================================
+function createDistinctMonsterMesh(m) {
+  const group = new THREE.Group();
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: m.color,
+    emissive: m.emissive,
+    emissiveIntensity: 0.45,
+    roughness: 0.3,
+    metalness: 0.4
+  });
+  const accentMat = new THREE.MeshStandardMaterial({
+    color: m.accent || 0xff2222,
+    emissive: m.accent || 0xff2222,
+    emissiveIntensity: 0.5,
+    roughness: 0.25
+  });
+  const eyeMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const pupilMat = new THREE.MeshBasicMaterial({ color: 0x050505 });
+
+  if (m.typeId === 'lizard') {
+    // Bipedal Yellow/Gold Clawed Monster matching the attached Moraff's Entrap screenshot!
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.78, 0.38), bodyMat);
+    torso.position.y = 0.85;
+    group.add(torso);
+
+    // Flat head with glowing red/orange eyes
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.42, 0.44), bodyMat);
+    head.position.y = 1.48;
+    group.add(head);
+
+    // Two wide-stance bent legs + clawed feet
+    [-0.28, 0.28].forEach(sideX => {
+      const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.45, 0.24), bodyMat);
+      thigh.position.set(sideX * 1.25, 0.42, 0);
+      group.add(thigh);
+
+      const foot = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.16, 0.44), accentMat);
+      foot.position.set(sideX * 1.35, 0.12, 0.08);
+      group.add(foot);
+    });
+
+    // Raised arms with 3-pronged claws (just like the yellow sprite in the screenshot!)
+    const leftArmGroup = new THREE.Group();
+    leftArmGroup.position.set(-0.46, 1.1, 0);
+    const lArm = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.18, 0.18), bodyMat);
+    const lForearm = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.46, 0.18), accentMat);
+    lForearm.position.set(-0.16, 0.24, 0);
+    leftArmGroup.add(lArm, lForearm);
+    group.add(leftArmGroup);
+
+    const rightArmGroup = new THREE.Group();
+    rightArmGroup.position.set(0.46, 1.1, 0);
+    const rArm = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.18, 0.18), bodyMat);
+    const rForearm = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.46, 0.18), accentMat);
+    rForearm.position.set(0.16, 0.24, 0);
+    rightArmGroup.add(rArm, rForearm);
+    group.add(rightArmGroup);
+
+    group.userData.leftLimb = leftArmGroup;
+    group.userData.rightLimb = rightArmGroup;
+  } else if (m.typeId === 'imp') {
+    // Horned Imp Monster with pointed horns, fangs, and hunched shoulders
+    const torso = new THREE.Mesh(new THREE.ConeGeometry(0.55, 1.05, 6), bodyMat);
+    torso.position.y = 0.75;
+    group.add(torso);
+
+    const head = new THREE.Mesh(new THREE.DodecahedronGeometry(0.38, 0), bodyMat);
+    head.position.y = 1.42;
+    group.add(head);
+
+    // Dual curved horns
+    [-0.22, 0.22].forEach(hx => {
+      const horn = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.48, 6), accentMat);
+      horn.position.set(hx, 1.78, 0);
+      horn.rotation.z = hx < 0 ? 0.38 : -0.38;
+      group.add(horn);
+    });
+
+    // Legs
+    [-0.22, 0.22].forEach(lx => {
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.1, 0.45, 8), accentMat);
+      leg.position.set(lx, 0.24, 0);
+      group.add(leg);
+    });
+  } else if (m.typeId === 'arachnid') {
+    // Multi-legged Spider / Crawler Monster
+    const abdomen = new THREE.Mesh(new THREE.BoxGeometry(0.82, 0.52, 0.92), bodyMat);
+    abdomen.position.y = 0.62;
+    group.add(abdomen);
+
+    const crest = new THREE.Mesh(new THREE.ConeGeometry(0.35, 0.55, 5), accentMat);
+    crest.position.set(0, 1.05, 0);
+    group.add(crest);
+
+    // 6 jointed spider legs extending outward
+    for (let i = -1; i <= 1; i++) {
+      [-1, 1].forEach(side => {
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.12, 0.12), accentMat);
+        leg.position.set(side * 0.58, 0.42, i * 0.28);
+        leg.rotation.z = side * -0.48;
+        group.add(leg);
+      });
+    }
+  } else {
+    // Heavy Mutant Golem with shoulder spikes and glowing visor jaw
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.86, 0.95, 0.54), bodyMat);
+    torso.position.y = 0.85;
+    group.add(torso);
+
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.46, 0.52), bodyMat);
+    head.position.y = 1.56;
+    group.add(head);
+
+    [-0.52, 0.52].forEach(sx => {
+      const spike = new THREE.Mesh(new THREE.ConeGeometry(0.18, 0.52, 5), accentMat);
+      spike.position.set(sx, 1.48, 0);
+      spike.rotation.z = sx < 0 ? 0.3 : -0.3;
+      group.add(spike);
+
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.5, 0.32), accentMat);
+      leg.position.set(sx * 0.55, 0.25, 0);
+      group.add(leg);
+    });
+  }
+
+  // Add menacing glowing eyes on the front & back so the monster is recognizable from both player ends
+  [-1, 1].forEach(zDir => {
+    [-0.14, 0.14].forEach(ex => {
+      const eye = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.09, 0.06), eyeMat);
+      eye.position.set(ex, 1.48, zDir * 0.24);
+      const pupil = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.07), pupilMat);
+      pupil.position.set(ex, 1.48, zDir * 0.25);
+      group.add(eye, pupil);
+    });
+  });
+
+  return group;
+}
+
+function createPlayerAvatarMesh(hexColor) {
+  const group = new THREE.Group();
+  const bodyGeo = new THREE.CylinderGeometry(0.42, 0.52, 1.25, 16);
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: hexColor,
+    emissive: hexColor,
+    emissiveIntensity: 0.35,
+    roughness: 0.25,
+    metalness: 0.7
+  });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  body.position.y = 0.65;
+  group.add(body);
+
+  const headGeo = new THREE.BoxGeometry(0.55, 0.36, 0.48);
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.2, metalness: 0.8 });
+  const head = new THREE.Mesh(headGeo, headMat);
+  head.position.y = 1.5;
+  group.add(head);
+
+  const visorGeo = new THREE.BoxGeometry(0.58, 0.18, 0.25);
+  const visorMat = new THREE.MeshBasicMaterial({ color: hexColor });
+  const visor = new THREE.Mesh(visorGeo, visorMat);
+  visor.position.set(0, 1.52, -0.16);
+  group.add(visor);
+
+  group.visible = false;
+  return group;
+}
+
+// ============================================================================
+// WebXR Controllers — Unified Single-Click / Single-Trigger Toggle
+// ============================================================================
+function setupWebXRControllers() {
+  vrControllerLeft = renderer.xr.getController(0);
+  vrControllerRight = renderer.xr.getController(1);
+
+  const leftLineGeo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0, -18)
+  ]);
+  vrLaserLeft = new THREE.Line(
+    leftLineGeo,
+    new THREE.LineBasicMaterial({ color: 0x00f0ff, transparent: true, opacity: 0.85 })
+  );
+  vrControllerLeft.add(vrLaserLeft);
+
+  const rightLineGeo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0, -18)
+  ]);
+  vrLaserRight = new THREE.Line(
+    rightLineGeo,
+    new THREE.LineBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.85 })
+  );
+  vrControllerRight.add(vrLaserRight);
+
+  // Floating 3D Wristwatch Radar attached to Left Arm in VR
+  vrRadarCanvas = document.createElement('canvas');
+  vrRadarCanvas.width = 256;
+  vrRadarCanvas.height = 384;
+  vrRadarTexture = new THREE.CanvasTexture(vrRadarCanvas);
+
+  vrWristwatchMesh = new THREE.Group();
+
+  // Futuristic metallic watch bezel & wrist strap cuff
+  const watchBezel = new THREE.Mesh(
+    new THREE.BoxGeometry(0.24, 0.04, 0.36),
+    new THREE.MeshStandardMaterial({ color: 0x0a1128, metalness: 0.9, roughness: 0.2 })
+  );
+  vrWristwatchMesh.add(watchBezel);
+
+  // Watch edge trim
+  const watchRim = new THREE.Mesh(
+    new THREE.BoxGeometry(0.25, 0.02, 0.37),
+    new THREE.MeshStandardMaterial({ color: 0x00f0ff, metalness: 0.5, roughness: 0.3 })
+  );
+  watchRim.position.y = -0.01;
+  vrWristwatchMesh.add(watchRim);
+
+  // Watch Radar Screen (Rotated 180° to be right-side up relative to user's view)
+  const watchScreen = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.21, 0.33),
+    new THREE.MeshBasicMaterial({ map: vrRadarTexture })
+  );
+  watchScreen.rotation.x = -Math.PI / 2;
+  watchScreen.rotation.z = 0; // Rotated 180 degrees from Math.PI so it is right-side up
+  watchScreen.position.y = 0.022;
+  vrWristwatchMesh.add(watchScreen);
+
+  // Angled comfortably toward the player's face in natural resting wrist position
+  vrWristwatchMesh.position.set(0.02, 0.08, -0.04);
+  vrWristwatchMesh.rotation.set(0.42, 0, -0.18);
+  vrControllerLeft.add(vrWristwatchMesh);
+
+  // Unified Trigger handler: Either controller's Trigger or Squeeze toggles the aimed square OR clicks Sky GUI!
+  const handleVRTriggerAction = (controller) => {
+    const skyHit = raycastSkyGUIFromController(controller);
+    if (skyHit) {
+      executeSkyButtonAction(skyHit);
+      return;
+    }
+    if (state.targetedSkyButton) {
+      executeSkyButtonAction(state.targetedSkyButton);
+      return;
+    }
+    if (!state.isRunning || state.isGameOver) return;
+    const hit = raycastFromController(controller);
+    if (hit) {
+      attemptTileToggle(hit.x, hit.z);
+    } else if (state.targetedCell) {
+      attemptTileToggle(state.targetedCell.x, state.targetedCell.z);
+    }
+  };
+
+  vrControllerLeft.addEventListener('selectstart', () => handleVRTriggerAction(vrControllerLeft));
+  vrControllerRight.addEventListener('selectstart', () => handleVRTriggerAction(vrControllerRight));
+  vrControllerLeft.addEventListener('squeezestart', () => handleVRTriggerAction(vrControllerLeft));
+  vrControllerRight.addEventListener('squeezestart', () => handleVRTriggerAction(vrControllerRight));
+
+  cameraRig.add(vrControllerLeft);
+  cameraRig.add(vrControllerRight);
+}
+
+function updateVRWristHUD() {
+  // Left-hand wrist GUI removed; telemetry is shown on the Floating Sky GUI
+}
+
+function setPlatformMode(mode) {
+  state.platformMode = mode;
+  const btnModeDesktop = document.getElementById('btn-mode-desktop');
+  const btnModeVR = document.getElementById('btn-mode-vr');
+  const hudBadge = document.getElementById('hud-platform-badge');
+
+  if (mode === 'vr') {
+    if (btnModeVR) btnModeVR.classList.add('mode-card-active');
+    if (btnModeDesktop) btnModeDesktop.classList.remove('mode-card-active');
+    if (hudBadge) hudBadge.textContent = 'VR Mode';
+  } else {
+    if (btnModeDesktop) btnModeDesktop.classList.add('mode-card-active');
+    if (btnModeVR) btnModeVR.classList.remove('mode-card-active');
+    if (hudBadge) hudBadge.textContent = 'Desktop Mode';
+  }
+}
+
+async function checkWebXRSupport() {
+  const vrBadge = document.getElementById('xr-support-badge');
+  // Detect VR browser (OculusBrowser, Quest, PicoBrowser, Vive, Mobile VR)
+  const isVRBrowser = /OculusBrowser|Quest|PicoBrowser|Vive|Mobile VR/i.test(navigator.userAgent);
+
+  let supported = false;
+  if (navigator.xr && navigator.xr.isSessionSupported) {
+    try {
+      supported = await navigator.xr.isSessionSupported('immersive-vr');
+    } catch (e) {
+      supported = false;
+    }
+  }
+
+  state.webxrSupported = supported;
+
+  // Default start screen option to VR Mode if running on a VR browser or immersive WebXR is available
+  if (isVRBrowser || supported) {
+    setPlatformMode('vr');
+  }
+
+  if (vrBadge) {
+    vrBadge.textContent = supported
+      ? 'Oculus Quest WebXR Headset Detected & Ready (VR Default Active)'
+      : (isVRBrowser ? 'VR Browser Detected (Defaulting to VR Mode)' : 'WebXR Ready (Open on Quest Browser for Headset VR)');
+    vrBadge.className = (supported || isVRBrowser)
+      ? 'text-xs font-medium px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+      : 'text-xs font-medium px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40';
+  }
+}
+
+// ============================================================================
+// Coordinate Conversions & Level Generation with Random Missing Squares/Pits
+// ============================================================================
+function gridToWorld(gx, gz) {
+  const wx = (gx - Math.floor(GRID_W / 2)) * TILE_SIZE;
+  const wz = (gz - Math.floor(GRID_H / 2)) * TILE_SIZE;
+  return { x: wx, z: wz };
+}
+
+// Compute classic Moraff's Entrap diagonal rainbow band color for any (gx, gz) square
+function getMoraffRainbowColor(gx, gz) {
+  // Concentric / diagonal rainbow wave like the attached DOS screenshot
+  const wave = ((gx * 0.85 + gz * 1.15) * 26) % 360;
+  const color = new THREE.Color();
+  color.setHSL(wave / 360, 0.92, 0.50);
+  const emissive = new THREE.Color();
+  emissive.setHSL(wave / 360, 0.90, 0.22);
+  return { color, emissive, cssHue: Math.round(wave) };
+}
+
+function generateLevelMap(levelNum) {
+  state.level = Math.max(1, Math.min(state.maxLevels, levelNum));
+  state.turnCount = 0;
+  state.isGameOver = false;
+  state.winnerText = '';
+  state.gameOverReason = '';
+
+  const grid = [];
+  for (let z = 0; z < GRID_H; z++) {
+    const row = [];
+    for (let x = 0; x < GRID_W; x++) {
+      if (z === 0) {
+        row.push(TILE_GOAL_P1);
+      } else if (z === GRID_H - 1) {
+        row.push(TILE_GOAL_P2);
+      } else {
+        row.push(TILE_FLOOR);
+      }
+    }
+    grid.push(row);
+  }
+
+  // Carve random multi-tile missing pit cutouts & scattered holes across the map (like the DOS screenshot)
+  // so enemies and players have to navigate around black missing floor sections
+  const numRectangularCutouts = Math.round((14 + state.level * 2) * 1.875); // + another 25% empty space
+  for (let c = 0; c < numRectangularCutouts; c++) {
+    const w = 1 + Math.floor(Math.random() * 4); // 1 to 4 tiles wide
+    const h = 1 + Math.floor(Math.random() * 3); // 1 to 3 tiles deep
+    const startX = Math.floor(Math.random() * (GRID_W - w));
+    const startZ = 2 + Math.floor(Math.random() * (GRID_H - 4 - h));
+    for (let dz = 0; dz < h; dz++) {
+      for (let dx = 0; dx < w; dx++) {
+        grid[startZ + dz][startX + dx] = TILE_VOID;
+      }
+    }
+  }
+
+  // Add additional scattered single missing squares
+  const extraPits = Math.round((28 + state.level * 3) * 1.875); // + another 25% empty space
+  for (let i = 0; i < extraPits; i++) {
+    const rx = Math.floor(Math.random() * GRID_W);
+    const rz = 2 + Math.floor(Math.random() * (GRID_H - 4));
+    grid[rz][rx] = TILE_VOID;
+  }
+
+  // Ensure Player 1 Start (South) and Player 2 Start (North) have a clear starting pad
+  const midX = Math.floor(GRID_W / 2);
+  for (let dx = -1; dx <= 1; dx++) {
+    grid[GRID_H - 2][midX + dx] = TILE_FLOOR;
+    grid[1][midX + dx] = TILE_FLOOR;
+  }
+
+  state.grid = grid;
+
+  // Reset Player Positions
+  state.players.p1.x = midX;
+  state.players.p1.z = GRID_H - 2;
+  state.players.p1.yaw = 0;
+  state.players.p1.alive = true;
+
+  state.players.p2.x = midX;
+  state.players.p2.z = 1;
+  state.players.p2.yaw = Math.PI;
+  state.players.p2.alive = true;
+  state.players.p2.active = (state.gameMode !== 'single');
+
+  // Spawn 12 to 22 Diverse 3D Monsters spread across the board:
+  // No monster may start closer than 10 spaces from any active player, and monsters stay separated on start!
+  const monsterCount = Math.max(3, Math.round((12 + state.level) / 2));
+  const monsters = [];
+  let attempts = 0;
+  while (monsters.length < monsterCount && attempts < 1200) {
+    attempts++;
+    const mx = Math.floor(Math.random() * GRID_W);
+    const mz = 2 + Math.floor(Math.random() * (GRID_H - 4));
+
+    // Must be at least 10 spaces away from Player 1 (and Player 2 if active)
+    const distP1 = Math.max(Math.abs(mx - state.players.p1.x), Math.abs(mz - state.players.p1.z));
+    if (distP1 < 10) continue;
+
+    if (state.players.p2.active) {
+      const distP2 = Math.max(Math.abs(mx - state.players.p2.x), Math.abs(mz - state.players.p2.z));
+      if (distP2 < 10) continue;
+    }
+
+    // Keep monsters separated from each other on start (at least 2 squares apart on early attempts)
+    const minMonsterSep = attempts < 700 ? 2.2 : 1.4;
+    const tooCloseToOtherMonster = monsters.some(om => Math.hypot(om.x - mx, om.z - mz) < minMonsterSep);
+    if (tooCloseToOtherMonster) continue;
+
+    // Ensure a solid rainbow floor tile underneath the spawned monster
+    if (attempts > 500) state.grid[mz][mx] = TILE_FLOOR;
+    if (state.grid[mz][mx] !== TILE_FLOOR) continue;
+
+    const mType = MONSTER_TYPES[(monsters.length + state.level - 1) % MONSTER_TYPES.length];
+    monsters.push({
+      id: `m_${Date.now()}_${monsters.length}`,
+      x: mx,
+      z: mz,
+      typeId: mType.id,
+      name: mType.name,
+      color: mType.color,
+      accent: mType.accent,
+      emissive: mType.emissive,
+      smarts: mType.smarts,
+      facingYaw: 0
+    });
+  }
+  state.monsters = monsters;
+
+  syncLocalCameraToPlayer(true);
+}
+
+// ============================================================================
+// Build & Update 3D Rainbow Board Meshes & Fluid Monster Groups
+// ============================================================================
+function rebuild3DBoard() {
+  interactivePlaneMeshes.forEach(m => scene.remove(m));
+  interactivePlaneMeshes = [];
+  tileMeshes = [];
+
+  for (let z = 0; z < GRID_H; z++) {
+    const rowMeshes = [];
+    for (let x = 0; x < GRID_W; x++) {
+      const mesh = createTileMesh(x, z, state.grid[z][x]);
+      scene.add(mesh);
+      interactivePlaneMeshes.push(mesh);
+      rowMeshes.push(mesh);
+    }
+    tileMeshes.push(rowMeshes);
+  }
+
+  syncMonsterMeshes(true);
+  updatePlayerAvatarMeshes();
+}
+
+function createTileMesh(gx, gz, tileType) {
+  const pos = gridToWorld(gx, gz);
+  const group = new THREE.BoxGeometry(TILE_SIZE * 0.96, 0.30, TILE_SIZE * 0.96);
+
+  let mat;
+  if (tileType === TILE_VOID) {
+    // Missing square: Pitch-black hole so it cleanly contrasts with the rainbow floor tiles
+    // while still being raycastable so clicking it creates a new rainbow floor square!
+    mat = new THREE.MeshBasicMaterial({
+      color: 0x02040a,
+      transparent: true,
+      opacity: 0.92
+    });
+  } else if (tileType === TILE_GOAL_P1) {
+    mat = new THREE.MeshStandardMaterial({
+      color: 0x00ffff,
+      emissive: 0x0088aa,
+      emissiveIntensity: 0.65,
+      roughness: 0.2,
+      metalness: 0.4
+    });
+  } else if (tileType === TILE_GOAL_P2) {
+    mat = new THREE.MeshStandardMaterial({
+      color: 0xff00aa,
+      emissive: 0x99004d,
+      emissiveIntensity: 0.65,
+      roughness: 0.2,
+      metalness: 0.4
+    });
+  } else {
+    // Vibrant Moraff's Entrap Rainbow Gradient Floor Tile!
+    const rainbow = getMoraffRainbowColor(gx, gz);
+    mat = new THREE.MeshStandardMaterial({
+      color: rainbow.color,
+      emissive: rainbow.emissive,
+      emissiveIntensity: 0.55,
+      roughness: 0.28,
+      metalness: 0.25
+    });
+  }
+
+  const mesh = new THREE.Mesh(group, mat);
+  mesh.position.set(pos.x, tileType === TILE_VOID ? -0.28 : -0.15, pos.z);
+  mesh.userData = { gridX: gx, gridZ: gz, tileType };
+
+  // Add dark tile border outline on active floor tiles so each rainbow square pops clearly
+  if (tileType !== TILE_VOID) {
+    const edges = new THREE.EdgesGeometry(group);
+    const line = new THREE.LineSegments(
+      edges,
+      new THREE.LineBasicMaterial({ color: 0x050814, transparent: true, opacity: 0.85 })
+    );
+    mesh.add(line);
+  }
+
+  return mesh;
+}
+
+function updateSingleTileMesh(gx, gz) {
+  if (!tileMeshes[gz] || !tileMeshes[gz][gx]) return;
+  const oldMesh = tileMeshes[gz][gx];
+  scene.remove(oldMesh);
+  const idx = interactivePlaneMeshes.indexOf(oldMesh);
+  if (idx !== -1) interactivePlaneMeshes.splice(idx, 1);
+
+  const newMesh = createTileMesh(gx, gz, state.grid[gz][gx]);
+  scene.add(newMesh);
+  interactivePlaneMeshes.push(newMesh);
+  tileMeshes[gz][gx] = newMesh;
+}
+
+// Reconcile monster meshes without destroying existing ones so they glide fluidly from square to square!
+function syncMonsterMeshes(instantSnap = false) {
+  const activeIds = new Set(state.monsters.map(m => m.id));
+
+  // Remove meshes of entrapped/eliminated monsters
+  for (const [id, mesh] of monsterMeshes.entries()) {
+    if (!activeIds.has(id)) {
+      scene.remove(mesh);
+      monsterMeshes.delete(id);
+    }
+  }
+
+  // Create or update target coordinates for living monsters
+  for (const m of state.monsters) {
+    const worldPos = gridToWorld(m.x, m.z);
+    let mesh = monsterMeshes.get(m.id);
+
+    if (!mesh) {
+      mesh = createDistinctMonsterMesh(m);
+      mesh.position.set(worldPos.x, 0, worldPos.z);
+      mesh.userData.targetX = worldPos.x;
+      mesh.userData.targetZ = worldPos.z;
+      mesh.userData.targetYaw = m.facingYaw || 0;
+      scene.add(mesh);
+      monsterMeshes.set(m.id, mesh);
+    } else {
+      // Compute facing angle toward movement direction
+      const dx = worldPos.x - mesh.position.x;
+      const dz = worldPos.z - mesh.position.z;
+      if (Math.hypot(dx, dz) > 0.05) {
+        mesh.userData.targetYaw = Math.atan2(dx, dz);
+      }
+      mesh.userData.targetX = worldPos.x;
+      mesh.userData.targetZ = worldPos.z;
+      if (instantSnap) {
+        mesh.position.set(worldPos.x, 0, worldPos.z);
+      }
+    }
+  }
+}
+
+function updatePlayerAvatarMeshes() {
+  const p1Pos = gridToWorld(state.players.p1.x, state.players.p1.z);
+  p1AvatarMesh.position.set(p1Pos.x, 0, p1Pos.z);
+  p1AvatarMesh.rotation.y = state.players.p1.yaw;
+  p1AvatarMesh.visible = (state.localPlayerKey !== 'p1') && state.players.p1.alive;
+
+  const p2Pos = gridToWorld(state.players.p2.x, state.players.p2.z);
+  p2AvatarMesh.position.set(p2Pos.x, 0, p2Pos.z);
+  p2AvatarMesh.rotation.y = state.players.p2.yaw;
+  p2AvatarMesh.visible = state.players.p2.active && (state.localPlayerKey !== 'p2') && state.players.p2.alive;
+}
+
+function syncLocalCameraToPlayer(instant = false) {
+  const localP = state.players[state.localPlayerKey];
+  const worldPos = gridToWorld(localP.x, localP.z);
+  if (instant) {
+    cameraRig.position.set(worldPos.x, 0, worldPos.z);
+    cameraRig.rotation.y = localP.yaw;
+  }
+}
+
+// ============================================================================
+// Core Entrap Gameplay Logic: One-Click Floor Toggle & BFS Monster Pathfinding
+// ============================================================================
+function getLocalPlayer() {
+  return state.players[state.localPlayerKey];
+}
+
+function moveLocalPlayerRelative(forwardDelta, rightDelta) {
+  if (!state.isRunning || state.isGameOver) return;
+  const p = getLocalPlayer();
+  if (!p.alive) return;
+
+  const yaw = cameraRig.rotation.y;
+  const fwdX = -Math.sin(yaw);
+  const fwdZ = -Math.cos(yaw);
+  const rightX = Math.cos(yaw);
+  const rightZ = -Math.sin(yaw);
+
+  const rawDx = fwdX * forwardDelta + rightX * rightDelta;
+  const rawDz = fwdZ * forwardDelta + rightZ * rightDelta;
+
+  let stepX = 0;
+  let stepZ = 0;
+  if (Math.abs(rawDx) > Math.abs(rawDz)) {
+    stepX = Math.sign(rawDx);
+  } else {
+    stepZ = Math.sign(rawDz);
+  }
+
+  if (stepX === 0 && stepZ === 0) return;
+
+  executePlayerAction({
+    playerKey: state.localPlayerKey,
+    actionType: 'move',
+    targetX: p.x + stepX,
+    targetZ: p.z + stepZ
+  });
+}
+
+// Unified One-Click Floor Toggle:
+// If target square is TILE_FLOOR -> deletes it into TILE_VOID
+// If target square is TILE_VOID -> creates a new rainbow TILE_FLOOR
+function attemptTileToggle(gx, gz) {
+  if (!state.isRunning || state.isGameOver) return;
+  const p = getLocalPlayer();
+  if (!p.alive) return;
+
+  if (gx < 0 || gx >= GRID_W || gz < 0 || gz >= GRID_H) return;
+
+  if (gz === 0 || gz === GRID_H - 1) {
+    showToast('Goal rows are permanent and cannot be modified.', 'amber');
+    return;
+  }
+  if ((state.players.p1.x === gx && state.players.p1.z === gz) ||
+      (state.players.p2.active && state.players.p2.x === gx && state.players.p2.z === gz)) {
+    showToast('Cannot delete the square a player is standing on!', 'amber');
+    return;
+  }
+
+  const dist = Math.max(Math.abs(gx - p.x), Math.abs(gz - p.z));
+  if (dist !== 1) {
+    showToast('You can only add or remove a square immediately adjacent to you (1 square away)!', 'amber');
+    return;
+  }
+
+  const currentTile = state.grid[gz][gx];
+  const actionType = (currentTile === TILE_FLOOR) ? 'delete_floor' : 'create_floor';
+
+  executePlayerAction({
+    playerKey: state.localPlayerKey,
+    actionType,
+    targetX: gx,
+    targetZ: gz
+  });
+}
+
+function executePlayerAction(action, isFromNetwork = false) {
+  if (state.isGameOver) return;
+
+  if (state.gameMode === 'join' && !isFromNetwork && state.dataConn && state.dataConn.open) {
+    state.dataConn.send({ type: 'PLAYER_ACTION', action });
+    return;
+  }
+
+  const actor = state.players[action.playerKey];
+  if (!actor || !actor.alive) return;
+
+  let actionSucceeded = false;
+
+  if (action.actionType === 'move') {
+    const nx = action.targetX;
+    const nz = action.targetZ;
+
+    // Enforce strictly non-diagonal cardinal movement (Forward, Back, Left, Right only)
+    const dx = Math.abs(nx - actor.x);
+    const dz = Math.abs(nz - actor.z);
+    if ((dx + dz) !== 1) {
+      showToast('Movement is restricted to Forward, Back, Left, and Right only (no diagonal movement).', 'amber');
+      return;
+    }
+
+    if (nx < 0 || nx >= GRID_W || nz < 0 || nz >= GRID_H) {
+      showToast('Boundary wall reached.', 'amber');
+      return;
+    }
+    const destTile = state.grid[nz][nx];
+    if (destTile === TILE_VOID) {
+      showToast('Missing floor square! Click / Trigger the black pit to create a rainbow floor bridge.', 'amber');
+      return;
+    }
+    actor.x = nx;
+    actor.z = nz;
+    sfx.step();
+    actionSucceeded = true;
+  } else if (action.actionType === 'delete_floor') {
+    const { targetX, targetZ } = action;
+    if (state.grid[targetZ] && state.grid[targetZ][targetX] === TILE_FLOOR) {
+      state.grid[targetZ][targetX] = TILE_VOID;
+      state.floorsDeleted++;
+      updateSingleTileMesh(targetX, targetZ);
+
+      // If a monster was standing on the deleted floor square, it plunges into the pit!
+      const beforeCount = state.monsters.length;
+      state.monsters = state.monsters.filter(m => !(m.x === targetX && m.z === targetZ));
+      if (state.monsters.length < beforeCount) {
+        state.monstersTrapped += (beforeCount - state.monsters.length);
+        sfx.monsterTrapped();
+        showToast('Monster entrapped in pit!', 'emerald');
+      } else {
+        sfx.deleteFloor();
+      }
+      actionSucceeded = true;
+    }
+  } else if (action.actionType === 'create_floor') {
+    const { targetX, targetZ } = action;
+    if (state.grid[targetZ] && state.grid[targetZ][targetX] === TILE_VOID) {
+      state.grid[targetZ][targetX] = TILE_FLOOR;
+      state.floorsCreated++;
+      updateSingleTileMesh(targetX, targetZ);
+      sfx.createFloor();
+      actionSucceeded = true;
+    }
+  }
+
+  if (!actionSucceeded) return;
+
+  state.turnCount++;
+
+  checkPlayerMonsterCollisions();
+  checkGoalVictory();
+
+  // Every move or floor toggle lets all monsters move 1 square toward the closest player, navigating around missing squares!
+  if (!state.isGameOver) {
+    stepAllMonstersOneSquare();
+    checkPlayerMonsterCollisions();
+  }
+
+  syncMonsterMeshes(false);
+  updatePlayerAvatarMeshes();
+  updateSkyGUI();
+  updateHUD();
+  updateVRWristHUD();
+  drawMinimap();
+
+  if (state.gameMode === 'host' && state.dataConn && state.dataConn.open) {
+    broadcastFullStateToPeer();
+  }
+}
+
+// Monsters only move if a valid adjacent floor square brings them strictly closer to their target player;
+// if they cannot move closer to the player this turn, they stay put and do not move!
+function computeMonsterNextStep(m, targetPlayer, occupiedSet) {
+  // Strictly 4 cardinal directions (Forward, Back, Left, Right) - strictly NO diagonal movement
+  const dirs = [
+    { dx: 0, dz: -1 }, // North / Forward
+    { dx: 0, dz: 1 },  // South / Back
+    { dx: -1, dz: 0 }, // West / Left
+    { dx: 1, dz: 0 }   // East / Right
+  ];
+
+  // Cardinal distance (Manhattan) & Euclidean tie-breaking
+  const currentManhattan = Math.abs(targetPlayer.x - m.x) + Math.abs(targetPlayer.z - m.z);
+  const currentEuclidean = Math.hypot(targetPlayer.x - m.x, targetPlayer.z - m.z);
+
+  let bestStep = { x: m.x, z: m.z };
+  let bestManhattan = currentManhattan;
+  let bestEuclidean = currentEuclidean;
+
+  for (const d of dirs) {
+    const nx = m.x + d.dx;
+    const nz = m.z + d.dz;
+    if (nx < 0 || nx >= GRID_W || nz < 0 || nz >= GRID_H) continue;
+    if (state.grid[nz][nx] === TILE_VOID) continue;
+
+    const isTarget = (nx === targetPlayer.x && nz === targetPlayer.z);
+    if (occupiedSet.has(`${nx},${nz}`) && !isTarget) continue;
+
+    if (isTarget) return { x: nx, z: nz };
+
+    const nextManhattan = Math.abs(targetPlayer.x - nx) + Math.abs(targetPlayer.z - nz);
+    const nextEuclidean = Math.hypot(targetPlayer.x - nx, targetPlayer.z - nz);
+
+    // Strictly move closer to the target player (Manhattan distance must decrease)
+    if (nextManhattan < bestManhattan || (nextManhattan === bestManhattan && nextManhattan < currentManhattan && nextEuclidean < bestEuclidean)) {
+      bestManhattan = nextManhattan;
+      bestEuclidean = nextEuclidean;
+      bestStep = { x: nx, z: nz };
+    }
+  }
+
+  // If no cardinal step brings the monster strictly closer to the player, stay put
+  return bestStep;
+}
+
+function stepAllMonstersOneSquare() {
+  const livingPlayers = [state.players.p1];
+  if (state.players.p2.active && state.players.p2.alive) {
+    livingPlayers.push(state.players.p2);
+  }
+
+  const occupiedSet = new Set(state.monsters.map(m => `${m.x},${m.z}`));
+
+  for (const m of state.monsters) {
+    let closestPlayer = livingPlayers[0];
+    let bestDistSq = Infinity;
+
+    for (const p of livingPlayers) {
+      if (!p.alive) continue;
+      const dx = p.x - m.x;
+      const dz = p.z - m.z;
+      const distSq = dx * dx + dz * dz;
+      if (distSq < bestDistSq) {
+        bestDistSq = distSq;
+        closestPlayer = p;
+      }
+    }
+
+    if (!closestPlayer) continue;
+
+    occupiedSet.delete(`${m.x},${m.z}`);
+    const step = computeMonsterNextStep(m, closestPlayer, occupiedSet);
+    m.facingYaw = Math.atan2(step.x - m.x, step.z - m.z);
+    m.x = step.x;
+    m.z = step.z;
+    occupiedSet.add(`${m.x},${m.z}`);
+  }
+}
+
+function checkPlayerMonsterCollisions() {
+  if (state.isGameOver) return;
+
+  for (const m of state.monsters) {
+    if (state.players.p1.alive && m.x === state.players.p1.x && m.z === state.players.p1.z) {
+      state.players.p1.alive = false;
+      if (state.gameMode === 'single') {
+        triggerGameOver(false, 'DEFEAT — CAUGHT BY MONSTER!', `A ${m.name} caught you at (${m.x}, ${m.z}) on Turn ${state.turnCount}.`);
+      } else {
+        triggerGameOver(state.localPlayerKey === 'p2', 'PLAYER 2 WINS!', `Player 1 was caught by a ${m.name}! Player 2 survives and wins.`);
+      }
+      return;
+    }
+
+    if (state.players.p2.active && state.players.p2.alive && m.x === state.players.p2.x && m.z === state.players.p2.z) {
+      state.players.p2.alive = false;
+      triggerGameOver(state.localPlayerKey === 'p1', 'PLAYER 1 WINS!', `Player 2 was caught by a ${m.name}! Player 1 survives and wins.`);
+      return;
+    }
+  }
+}
+
+function checkGoalVictory() {
+  if (state.isGameOver) return;
+
+  if (state.players.p1.alive && state.players.p1.z === 0) {
+    if (state.gameMode === 'single') {
+      triggerGameOver(true, `LEVEL ${state.level} CLEARED!`, `You crossed the rainbow grid and escaped the monsters in ${state.turnCount} turns!`);
+    } else {
+      triggerGameOver(state.localPlayerKey === 'p1', 'PLAYER 1 FINISHED FIRST!', `Player 1 reached the North Goal in ${state.turnCount} turns!`);
+    }
+    return;
+  }
+
+  if (state.players.p2.active && state.players.p2.alive && state.players.p2.z === GRID_H - 1) {
+    triggerGameOver(state.localPlayerKey === 'p2', 'PLAYER 2 FINISHED FIRST!', `Player 2 reached the South Goal in ${state.turnCount} turns!`);
+  }
+}
+
+function triggerGameOver(isLocalVictory, headline, detail) {
+  state.isGameOver = true;
+  state.winnerText = headline;
+  state.gameOverReason = detail;
+
+  if (isLocalVictory) {
+    sfx.victory();
+  } else {
+    sfx.defeat();
+  }
+
+  const modal = document.getElementById('gameover-modal');
+  const titleEl = document.getElementById('gameover-title');
+  const descEl = document.getElementById('gameover-desc');
+  const nextBtn = document.getElementById('btn-next-level');
+
+  if (modal && titleEl && descEl) {
+    titleEl.textContent = headline;
+    titleEl.className = isLocalVictory
+      ? 'text-2xl md:text-3xl font-extrabold text-emerald-400 tracking-tight'
+      : 'text-2xl md:text-3xl font-extrabold text-rose-400 tracking-tight';
+    descEl.textContent = detail;
+    if (nextBtn) {
+      nextBtn.style.display = (isLocalVictory && state.level < state.maxLevels) ? 'inline-flex' : 'none';
+    }
+    modal.classList.remove('hidden');
+  }
+
+  if (document.pointerLockElement) {
+    document.exitPointerLock();
+  }
+}
+
+// ============================================================================
+// Peer-to-Peer Multiplayer & Direct WebRTC Voice Chat (PeerJS)
+// ============================================================================
+function sanitizeRoomId(rawName) {
+  const cleaned = (rawName || 'Xellossan').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  return `moraff-entrap-vr-p2p-${cleaned || 'xellossan'}`;
+}
+
+async function acquireMicrophoneStream() {
+  if (state.localStream) return state.localStream;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    updateVoiceStatus('Mic API unavailable in this context', false);
+    return null;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false
+    });
+    state.localStream = stream;
+    setupMicLevelMeter(stream);
+    updateVoiceStatus('Mic Live (Ready for P2P Audio)', true);
+    return stream;
+  } catch (err) {
+    updateVoiceStatus('Mic Permission Skipped (Data P2P Active)', false);
+    return null;
+  }
+}
+
+function setupMicLevelMeter(stream) {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const aCtx = new AudioCtx();
+    const source = aCtx.createMediaStreamSource(stream);
+    const analyser = aCtx.createAnalyser();
+    analyser.fftSize = 64;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const meterBar = document.getElementById('mic-level-bar');
+    setInterval(() => {
+      if (state.micMuted || !state.localStream) {
+        if (meterBar) meterBar.style.width = '0%';
+        return;
+      }
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i];
+      const avg = sum / data.length;
+      const pct = Math.min(100, Math.round((avg / 128) * 100));
+      if (meterBar) meterBar.style.width = `${pct}%`;
+    }, 100);
+  } catch (e) {}
+}
+
+function toggleMicrophoneMute() {
+  if (!state.localStream) {
+    acquireMicrophoneStream();
+    return;
+  }
+  state.micMuted = !state.micMuted;
+  state.localStream.getAudioTracks().forEach(track => {
+    track.enabled = !state.micMuted;
+  });
+  const muteBtn = document.getElementById('btn-toggle-mic');
+  if (muteBtn) {
+    muteBtn.textContent = state.micMuted ? 'Mic Muted (Unmute)' : 'Voice Chat Active (Mute)';
+    muteBtn.className = state.micMuted
+      ? 'cyber-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/40'
+      : 'cyber-btn px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40';
+  }
+}
+
+function updateVoiceStatus(text, isOnline) {
+  state.voiceStatus = text;
+  const el = document.getElementById('hud-voice-status');
+  if (el) {
+    el.textContent = text;
+    el.className = isOnline ? 'text-xs font-semibold text-emerald-300' : 'text-xs font-semibold text-amber-300';
+  }
+}
+
+function updateNetStatus(text) {
+  state.netStatus = text;
+  const el = document.getElementById('hud-net-status');
+  if (el) el.textContent = text;
+}
+
+async function initMultiplayerPeer(mode, roomName) {
+  if (typeof Peer === 'undefined') {
+    updateNetStatus('PeerJS CDN unavailable - Playing Local Match');
+    return;
+  }
+
+  if (state.peer) {
+    try { state.peer.destroy(); } catch (e) {}
+  }
+
+  await acquireMicrophoneStream();
+
+  const hostPeerId = sanitizeRoomId(roomName);
+
+  if (mode === 'host') {
+    state.localPlayerKey = 'p1';
+    state.players.p2.active = true;
+    updateNetStatus(`Hosting Room "${roomName}" — Waiting for Player 2...`);
+
+    const peer = new Peer(hostPeerId, { debug: 1 });
+    state.peer = peer;
+
+    peer.on('open', () => {
+      updateNetStatus(`Room "${roomName}" Open (Host P1 South)`);
+      showToast(`Hosting Room "${roomName}". Waiting for Player 2 to join!`, 'cyan');
+    });
+
+    peer.on('connection', (conn) => {
+      state.dataConn = conn;
+      setupDataConnectionHandlers(conn);
+      updateNetStatus(`Connected: 2 Players in "${roomName}"`);
+      showToast('Player 2 joined on the North side of the map!', 'emerald');
+
+      if (state.localStream) {
+        const call = peer.call(conn.peer, state.localStream);
+        setupMediaCallHandlers(call);
+      }
+    });
+
+    peer.on('call', (call) => {
+      call.answer(state.localStream || undefined);
+      setupMediaCallHandlers(call);
+    });
+
+    peer.on('error', (err) => {
+      updateNetStatus(`Room Notice: ${err.type || 'P2P Ready'}`);
+    });
+  } else if (mode === 'join') {
+    state.localPlayerKey = 'p2';
+    state.players.p2.active = true;
+    updateNetStatus(`Joining Room "${roomName}"...`);
+
+    const peer = new Peer(undefined, { debug: 1 });
+    state.peer = peer;
+
+    peer.on('open', () => {
+      const conn = peer.connect(hostPeerId, { reliable: true });
+      state.dataConn = conn;
+      setupDataConnectionHandlers(conn);
+
+      if (state.localStream) {
+        const call = peer.call(hostPeerId, state.localStream);
+        setupMediaCallHandlers(call);
+      }
+    });
+
+    peer.on('call', (call) => {
+      call.answer(state.localStream || undefined);
+      setupMediaCallHandlers(call);
+    });
+
+    peer.on('error', (err) => {
+      updateNetStatus(`Join Status: Host "${roomName}" not found yet (${err.type})`);
+      showToast(`Could not reach host "${roomName}" yet — practicing on North Spawn (P2) until Host connects.`, 'amber');
+    });
+  }
+}
+
+function setupDataConnectionHandlers(conn) {
+  conn.on('open', () => {
+    updateNetStatus(`P2P Linked (${state.roomName})`);
+    if (state.gameMode === 'host') {
+      broadcastFullStateToPeer();
+    } else {
+      conn.send({ type: 'CLIENT_READY' });
+    }
+  });
+
+  conn.on('data', (payload) => {
+    if (!payload || typeof payload !== 'object') return;
+
+    if (payload.type === 'CLIENT_READY' && state.gameMode === 'host') {
+      broadcastFullStateToPeer();
+    } else if (payload.type === 'STATE_SYNC' && state.gameMode === 'join') {
+      applyNetworkStateSync(payload.snapshot);
+    } else if (payload.type === 'PLAYER_ACTION' && state.gameMode === 'host') {
+      executePlayerAction(payload.action, true);
+    } else if (payload.type === 'YAW_SYNC') {
+      const otherKey = payload.playerKey;
+      if (otherKey !== state.localPlayerKey && state.players[otherKey]) {
+        state.players[otherKey].yaw = payload.yaw;
+        updatePlayerAvatarMeshes();
+      }
+    }
+  });
+
+  conn.on('close', () => {
+    updateNetStatus('Peer Disconnected');
+    showToast('Other player disconnected from room.', 'amber');
+  });
+}
+
+function setupMediaCallHandlers(call) {
+  if (!call) return;
+  state.mediaCall = call;
+  call.on('stream', (remoteStream) => {
+    if (!state.remoteAudioEl) {
+      state.remoteAudioEl = new Audio();
+      state.remoteAudioEl.autoplay = true;
+    }
+    state.remoteAudioEl.srcObject = remoteStream;
+    state.remoteAudioEl.play().catch(() => {});
+    updateVoiceStatus('Direct P2P Voice Connected', true);
+    showToast('Direct P2P Voice Chat Connected!', 'emerald');
+  });
+}
+
+function broadcastFullStateToPeer() {
+  if (!state.dataConn || !state.dataConn.open) return;
+  state.dataConn.send({
+    type: 'STATE_SYNC',
+    snapshot: {
+      level: state.level,
+      turnCount: state.turnCount,
+      floorsCreated: state.floorsCreated,
+      floorsDeleted: state.floorsDeleted,
+      monstersTrapped: state.monstersTrapped,
+      grid: state.grid,
+      players: state.players,
+      monsters: state.monsters,
+      isGameOver: state.isGameOver,
+      winnerText: state.winnerText,
+      gameOverReason: state.gameOverReason
+    }
+  });
+}
+
+function applyNetworkStateSync(snap) {
+  if (!snap) return;
+  const levelChanged = (state.level !== snap.level);
+  state.level = snap.level;
+  state.turnCount = snap.turnCount;
+  state.floorsCreated = snap.floorsCreated;
+  state.floorsDeleted = snap.floorsDeleted;
+  state.monstersTrapped = snap.monstersTrapped;
+  state.grid = snap.grid;
+  state.players.p1 = snap.players.p1;
+  state.players.p2 = snap.players.p2;
+  state.monsters = snap.monsters;
+
+  if (levelChanged) {
+    rebuild3DBoard();
+  } else {
+    for (let z = 0; z < GRID_H; z++) {
+      for (let x = 0; x < GRID_W; x++) {
+        if (tileMeshes[z] && tileMeshes[z][x] && tileMeshes[z][x].userData.tileType !== state.grid[z][x]) {
+          updateSingleTileMesh(x, z);
+        }
+      }
+    }
+    syncMonsterMeshes(false);
+    updatePlayerAvatarMeshes();
+  }
+
+  updateSkyGUI();
+  updateHUD();
+  updateVRWristHUD();
+  drawMinimap();
+
+  if (snap.isGameOver && !state.isGameOver) {
+    const localWon = (state.localPlayerKey === 'p2' && snap.winnerText.includes('PLAYER 2')) ||
+                     (state.localPlayerKey === 'p1' && snap.winnerText.includes('PLAYER 1'));
+    triggerGameOver(localWon, snap.winnerText, snap.gameOverReason);
+  } else if (!snap.isGameOver && state.isGameOver) {
+    state.isGameOver = false;
+    document.getElementById('gameover-modal').classList.add('hidden');
+  }
+}
+
+// ============================================================================
+// Raycasting & Target Selection (Grid Tiles + Floating Sky GUI)
+// ============================================================================
+function raycastSkyGUIFromController(controller) {
+  const tempMatrix = new THREE.Matrix4();
+  tempMatrix.identity().extractRotation(controller.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+
+  const intersects = raycaster.intersectObjects(skyGuiButtons, false);
+  if (intersects.length > 0) {
+    const mesh = intersects[0].object;
+    return { ...mesh.userData, mesh };
+  }
+  return null;
+}
+
+function raycastFromController(controller) {
+  const tempMatrix = new THREE.Matrix4();
+  tempMatrix.identity().extractRotation(controller.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+
+  const intersects = raycaster.intersectObjects(interactivePlaneMeshes, false);
+  if (intersects.length > 0) {
+    const hit = intersects[0].object;
+    if (hit.userData && typeof hit.userData.gridX === 'number') {
+      return {
+        x: hit.userData.gridX,
+        z: hit.userData.gridZ,
+        tileType: state.grid[hit.userData.gridZ][hit.userData.gridX]
+      };
+    }
+  }
+  return null;
+}
+
+function updateReticleTarget() {
+  if (!state.isRunning) {
+    targetHighlightMesh.visible = false;
+    return;
+  }
+
+  let skyHit = null;
+  let hitInfo = null;
+
+  if (renderer.xr.isPresenting && vrControllerRight) {
+    skyHit = raycastSkyGUIFromController(vrControllerRight) || raycastSkyGUIFromController(vrControllerLeft);
+    if (!skyHit) {
+      hitInfo = raycastFromController(vrControllerRight) || raycastFromController(vrControllerLeft);
+    }
+  } else {
+    raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+    const skyIntersects = raycaster.intersectObjects(skyGuiButtons, false);
+    if (skyIntersects.length > 0) {
+      const mesh = skyIntersects[0].object;
+      skyHit = { ...mesh.userData, mesh };
+    } else {
+      const intersects = raycaster.intersectObjects(interactivePlaneMeshes, false);
+      if (intersects.length > 0) {
+        const obj = intersects[0].object;
+        if (obj.userData && typeof obj.userData.gridX === 'number') {
+          hitInfo = {
+            x: obj.userData.gridX,
+            z: obj.userData.gridZ,
+            tileType: state.grid[obj.userData.gridZ][obj.userData.gridX]
+          };
+        }
+      }
+    }
+  }
+
+  // Update Sky GUI button hover highlight if changed
+  const prevSkyMesh = state.targetedSkyButton ? state.targetedSkyButton.mesh : null;
+  const newSkyMesh = skyHit ? skyHit.mesh : null;
+  state.targetedSkyButton = skyHit;
+  if (prevSkyMesh !== newSkyMesh) {
+    if (prevSkyMesh) renderSkyButtonCanvas(prevSkyMesh, false);
+    if (newSkyMesh) renderSkyButtonCanvas(newSkyMesh, true);
+  }
+
+  const reticleRing = document.getElementById('reticle-ring-el');
+  const reticleLabel = document.getElementById('reticle-label-el');
+
+  if (skyHit) {
+    state.targetedCell = null;
+    targetHighlightMesh.visible = false;
+    if (reticleRing) reticleRing.className = 'reticle-ring reticle-create';
+    if (reticleLabel) reticleLabel.textContent = `${skyHit.label} — Click / Trigger to Activate`;
+    return;
+  }
+
+  const localP = getLocalPlayer();
+
+  if (hitInfo) {
+    const dist = Math.max(Math.abs(hitInfo.x - localP.x), Math.abs(hitInfo.z - localP.z));
+    state.targetedCell = { ...hitInfo, distanceGrid: dist };
+
+    const worldPos = gridToWorld(hitInfo.x, hitInfo.z);
+    targetHighlightMesh.position.set(worldPos.x, 0.04, worldPos.z);
+    targetHighlightMesh.visible = (dist === 1 && hitInfo.z !== 0 && hitInfo.z !== GRID_H - 1);
+
+    if (hitInfo.tileType === TILE_VOID) {
+      targetHighlightMesh.material.color.setHex(0x00ff88);
+      if (reticleRing) reticleRing.className = dist === 1 ? 'reticle-ring reticle-create' : 'reticle-ring';
+      if (reticleLabel) reticleLabel.textContent = dist === 1
+        ? `[${hitInfo.x},${hitInfo.z}] ADJACENT MISSING SQUARE — Click / Trigger: CREATE FLOOR`
+        : `[${hitInfo.x},${hitInfo.z}] Must Be Immediately Adjacent (1 sq away)`;
+    } else if (hitInfo.tileType === TILE_FLOOR) {
+      targetHighlightMesh.material.color.setHex(0xff2a85);
+      if (reticleRing) reticleRing.className = dist === 1 ? 'reticle-ring reticle-delete' : 'reticle-ring';
+      if (reticleLabel) reticleLabel.textContent = dist === 1
+        ? `[${hitInfo.x},${hitInfo.z}] ADJACENT RAINBOW FLOOR — Click / Trigger: DELETE SQUARE`
+        : `[${hitInfo.x},${hitInfo.z}] Must Be Immediately Adjacent (1 sq away)`;
+    } else {
+      targetHighlightMesh.visible = false;
+      if (reticleRing) reticleRing.className = 'reticle-ring';
+      if (reticleLabel) reticleLabel.textContent = `[${hitInfo.x},${hitInfo.z}] GOAL ZONE`;
+    }
+  } else {
+    state.targetedCell = null;
+    targetHighlightMesh.visible = false;
+    if (reticleRing) reticleRing.className = 'reticle-ring';
+    if (reticleLabel) reticleLabel.textContent = 'Aim at Grid Square or Look Up for Sky GUI';
+  }
+}
+
+// ============================================================================
+// Oculus Quest WebXR Gamepad Thumbstick Polling
+// ============================================================================
+function pollVRControllerThumbsticks(nowMs) {
+  const session = renderer.xr.getSession();
+  if (!session || !state.isRunning) return;
+
+  for (const source of session.inputSources) {
+    if (!source.gamepad) continue;
+    const axes = source.gamepad.axes;
+    const stickX = axes.length >= 4 ? axes[2] : (axes[0] || 0);
+    const stickY = axes.length >= 4 ? axes[3] : (axes[1] || 0);
+
+    if (source.handedness === 'left') {
+      const mag = Math.hypot(stickX, stickY);
+      if (!state.isGameOver && mag > 0.65 && vrStickState.leftReady && (nowMs - vrStickState.lastStepTime > 250)) {
+        vrStickState.leftReady = false;
+        vrStickState.lastStepTime = nowMs;
+
+        if (Math.abs(stickY) >= Math.abs(stickX)) {
+          moveLocalPlayerRelative(stickY < 0 ? 1 : -1, 0);
+        } else {
+          moveLocalPlayerRelative(0, stickX > 0 ? 1 : -1);
+        }
+      } else if (mag < 0.3) {
+        vrStickState.leftReady = true;
+      }
+
+      if (source.gamepad.buttons[4] && source.gamepad.buttons[4].pressed && vrStickState.leftReady) {
+        vrStickState.leftReady = false;
+        if (state.targetedSkyButton) executeSkyButtonAction(state.targetedSkyButton);
+        else if (state.targetedCell) attemptTileToggle(state.targetedCell.x, state.targetedCell.z);
+      }
+    } else if (source.handedness === 'right') {
+      if (Math.abs(stickX) > 0.6 && vrStickState.rightReady) {
+        vrStickState.rightReady = false;
+        const turnAngle = stickX > 0 ? -Math.PI / 4 : Math.PI / 4;
+        rotateLocalCharacter(turnAngle);
+      } else if (Math.abs(stickX) < 0.3) {
+        vrStickState.rightReady = true;
+      }
+
+      if (source.gamepad.buttons[4] && source.gamepad.buttons[4].pressed && vrStickState.rightReady) {
+        vrStickState.rightReady = false;
+        if (state.targetedSkyButton) executeSkyButtonAction(state.targetedSkyButton);
+        else if (state.targetedCell) attemptTileToggle(state.targetedCell.x, state.targetedCell.z);
+      }
+    }
+  }
+}
+
+function rotateLocalCharacter(deltaYaw) {
+  const localP = getLocalPlayer();
+  localP.yaw += deltaYaw;
+  cameraRig.rotation.y = localP.yaw;
+
+  if (state.dataConn && state.dataConn.open) {
+    state.dataConn.send({
+      type: 'YAW_SYNC',
+      playerKey: state.localPlayerKey,
+      yaw: localP.yaw
+    });
+  }
+  drawMinimap();
+}
+
+// ============================================================================
+// Overhead Minimap / Radar (HUD & VR Wristwatch Radar)
+// ============================================================================
+function drawMinimap() {
+  const canvas = document.getElementById('minimap-canvas');
+  if (canvas && state.grid.length) {
+    renderRadarToCanvas(canvas, false);
+  }
+  if (vrRadarCanvas && state.grid.length) {
+    renderRadarToCanvas(vrRadarCanvas, true);
+    if (vrRadarTexture) vrRadarTexture.needsUpdate = true;
+  }
+}
+
+function renderRadarToCanvas(targetCanvas, isWrist) {
+  const ctx = targetCanvas.getContext('2d');
+  const cw = targetCanvas.width;
+  const ch = targetCanvas.height;
+  ctx.clearRect(0, 0, cw, ch);
+
+  let gridOffsetY = 0;
+  let gridAvailH = ch;
+
+  if (isWrist) {
+    // Header for Wristwatch Radar
+    ctx.fillStyle = '#060c1d';
+    ctx.fillRect(0, 0, cw, ch);
+
+    ctx.fillStyle = '#00f0ff';
+    ctx.font = 'bold 19px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`WRIST RADAR | L${state.level}`, cw / 2, 22);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '14px monospace';
+    ctx.fillText(`Turns: ${state.turnCount} | Foes: ${state.monsters.length}`, cw / 2, 42);
+
+    gridOffsetY = 48;
+    gridAvailH = ch - gridOffsetY - 8;
+  }
+
+  const cellW = cw / GRID_W;
+  const cellH = gridAvailH / GRID_H;
+
+  for (let z = 0; z < GRID_H; z++) {
+    for (let x = 0; x < GRID_W; x++) {
+      const t = state.grid[z][x];
+      if (t === TILE_VOID) {
+        ctx.fillStyle = '#02040a';
+      } else if (t === TILE_GOAL_P1) {
+        ctx.fillStyle = '#00f0ff';
+      } else if (t === TILE_GOAL_P2) {
+        ctx.fillStyle = '#ff007f';
+      } else {
+        const rainbow = getMoraffRainbowColor(x, z);
+        ctx.fillStyle = `hsl(${rainbow.cssHue}, 85%, 46%)`;
+      }
+      ctx.fillRect(x * cellW + 0.5, gridOffsetY + z * cellH + 0.5, cellW - 1, cellH - 1);
+    }
+  }
+
+  if (state.targetedCell) {
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = isWrist ? 2.5 : 1.6;
+    ctx.strokeRect(state.targetedCell.x * cellW + 1, gridOffsetY + state.targetedCell.z * cellH + 1, cellW - 2, cellH - 2);
+  }
+
+  for (const m of state.monsters) {
+    ctx.fillStyle = '#fde047';
+    ctx.strokeStyle = '#dc2626';
+    ctx.lineWidth = isWrist ? 2.0 : 1.2;
+    ctx.beginPath();
+    ctx.arc((m.x + 0.5) * cellW, gridOffsetY + (m.z + 0.5) * cellH, Math.min(cellW, cellH) * 0.40, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  drawPlayerOnMinimap(ctx, state.players.p1, cellW, cellH, '#00f0ff', gridOffsetY);
+  if (state.players.p2.active) {
+    drawPlayerOnMinimap(ctx, state.players.p2, cellW, cellH, '#ff007f', gridOffsetY);
+  }
+
+  if (isWrist) {
+    // Outer cyan bezel border on wristwatch screen
+    ctx.strokeStyle = '#00f0ff';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(2, 2, cw - 4, ch - 4);
+  }
+}
+
+function drawPlayerOnMinimap(ctx, p, cellW, cellH, color, offsetY = 0) {
+  if (!p.alive) return;
+  const cx = (p.x + 0.5) * cellW;
+  const cy = offsetY + (p.z + 0.5) * cellH;
+  const r = Math.min(cellW, cellH) * 0.42;
+
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  const fx = cx - Math.sin(p.yaw) * (r * 1.6);
+  const fy = cy - Math.cos(p.yaw) * (r * 1.6);
+  ctx.strokeStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(fx, fy);
+  ctx.stroke();
+}
+
+// ============================================================================
+// UI Binding, Unified Click Handler, and Fluid Render Loop
+// ============================================================================
+function bindUIListeners() {
+  const btnModeDesktop = document.getElementById('btn-mode-desktop');
+  const btnModeVR = document.getElementById('btn-mode-vr');
+
+  btnModeDesktop.addEventListener('click', () => setPlatformMode('desktop'));
+  btnModeVR.addEventListener('click', () => setPlatformMode('vr'));
+
+  document.getElementById('btn-start-single').addEventListener('click', () => launchSession('single'));
+  document.getElementById('btn-start-host').addEventListener('click', () => launchSession('host'));
+  document.getElementById('btn-start-join').addEventListener('click', () => launchSession('join'));
+
+  document.getElementById('btn-toggle-mic').addEventListener('click', () => toggleMicrophoneMute());
+
+  document.getElementById('btn-toggle-sfx').addEventListener('click', (e) => {
+    state.soundMuted = !state.soundMuted;
+    e.currentTarget.textContent = state.soundMuted ? 'SFX: Muted' : 'SFX: On';
+  });
+
+  document.getElementById('btn-back-menu').addEventListener('click', () => {
+    if (document.pointerLockElement) document.exitPointerLock();
+    state.isRunning = false;
+    document.getElementById('start-modal').classList.remove('hidden');
+    document.getElementById('gameover-modal').classList.add('hidden');
+  });
+
+  document.getElementById('btn-restart-level').addEventListener('click', () => {
+    changeToLevel(state.level);
+  });
+
+  const hudLevelSelect = document.getElementById('hud-level-select');
+  if (hudLevelSelect) {
+    hudLevelSelect.addEventListener('change', (e) => {
+      const chosen = parseInt(e.target.value, 10) || 1;
+      changeToLevel(chosen);
+    });
+  }
+
+  document.getElementById('btn-retry-level').addEventListener('click', () => {
+    changeToLevel(state.level);
+  });
+
+  document.getElementById('btn-next-level').addEventListener('click', () => {
+    changeToLevel(Math.min(state.maxLevels, state.level + 1));
+  });
+
+  // On-Screen Touch / Click Movement & Unified Single-Button Floor Toggle
+  document.getElementById('pad-up').addEventListener('click', () => moveLocalPlayerRelative(1, 0));
+  document.getElementById('pad-down').addEventListener('click', () => moveLocalPlayerRelative(-1, 0));
+  document.getElementById('pad-left').addEventListener('click', () => moveLocalPlayerRelative(0, -1));
+  document.getElementById('pad-right').addEventListener('click', () => moveLocalPlayerRelative(0, 1));
+  document.getElementById('pad-rot-left').addEventListener('click', () => rotateLocalCharacter(Math.PI / 4));
+  document.getElementById('pad-rot-right').addEventListener('click', () => rotateLocalCharacter(-Math.PI / 4));
+
+  const handleToggleTrigger = () => {
+    if (state.targetedSkyButton) {
+      executeSkyButtonAction(state.targetedSkyButton);
+    } else if (state.targetedCell) {
+      attemptTileToggle(state.targetedCell.x, state.targetedCell.z);
+    }
+  };
+
+  const btnToggle = document.getElementById('btn-action-toggle');
+  if (btnToggle) btnToggle.addEventListener('click', handleToggleTrigger);
+  const btnDel = document.getElementById('btn-action-delete');
+  if (btnDel) btnDel.addEventListener('click', handleToggleTrigger);
+  const btnCre = document.getElementById('btn-action-create');
+  if (btnCre) btnCre.addEventListener('click', handleToggleTrigger);
+
+  // Keyboard Controls (WASD + Arrow Keys + Q/E Rotation + Space/F to Toggle Floor)
+  window.addEventListener('keydown', (e) => {
+    if (!state.isRunning) return;
+    if (document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT')) return;
+
+    const code = e.code;
+    if (code === 'KeyW' || code === 'ArrowUp') {
+      e.preventDefault();
+      moveLocalPlayerRelative(1, 0);
+    } else if (code === 'KeyS' || code === 'ArrowDown') {
+      e.preventDefault();
+      moveLocalPlayerRelative(-1, 0);
+    } else if (code === 'KeyA' || code === 'ArrowLeft') {
+      e.preventDefault();
+      moveLocalPlayerRelative(0, -1);
+    } else if (code === 'KeyD' || code === 'ArrowRight') {
+      e.preventDefault();
+      moveLocalPlayerRelative(0, 1);
+    } else if (code === 'KeyQ') {
+      e.preventDefault();
+      rotateLocalCharacter(Math.PI / 6);
+    } else if (code === 'KeyE') {
+      e.preventDefault();
+      rotateLocalCharacter(-Math.PI / 6);
+    } else if (code === 'Space' || code === 'KeyF') {
+      e.preventDefault();
+      handleToggleTrigger();
+    }
+  });
+
+  // Desktop Mouse Look & Single-Click Floor Toggle / Sky GUI Click
+  const canvasEl = renderer.domElement;
+  canvasEl.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  canvasEl.addEventListener('mousedown', (e) => {
+    if (!state.isRunning) return;
+    sfx.init();
+
+    if (state.platformMode === 'desktop' && document.pointerLockElement !== canvasEl) {
+      if (canvasEl.requestPointerLock) {
+        try { canvasEl.requestPointerLock(); } catch (err) {}
+      }
+    }
+
+    // Any mouse click (Left or Right) activates the targeted Sky GUI button OR toggles the targeted grid square!
+    if (state.targetedSkyButton) {
+      executeSkyButtonAction(state.targetedSkyButton);
+      return;
+    }
+
+    if (state.targetedCell && (e.button === 0 || e.button === 2)) {
+      attemptTileToggle(state.targetedCell.x, state.targetedCell.z);
+    }
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!state.isRunning) return;
+    if (document.pointerLockElement === canvasEl || e.buttons === 4) {
+      const sensitivity = 0.0024;
+      rotateLocalCharacter(-e.movementX * sensitivity);
+      // Allow looking up to ~70 degrees so player can easily aim at the Floating Sky GUI!
+      camera.rotation.x = Math.max(-Math.PI / 2.6, Math.min(Math.PI / 2.3, camera.rotation.x - e.movementY * sensitivity));
+    }
+  });
+}
+
+async function launchSession(selectedGameMode) {
+  sfx.init();
+  const roomInput = document.getElementById('room-name-input');
+  const startLvlInput = document.getElementById('start-level-select');
+  const chosenStartLevel = startLvlInput ? (parseInt(startLvlInput.value, 10) || 1) : 1;
+
+  state.roomName = (roomInput && roomInput.value.trim()) ? roomInput.value.trim() : 'Xellossan';
+  state.gameMode = selectedGameMode;
+  state.localPlayerKey = (selectedGameMode === 'join') ? 'p2' : 'p1';
+  state.isRunning = true;
+
+  document.getElementById('start-modal').classList.add('hidden');
+  document.getElementById('gameover-modal').classList.add('hidden');
+
+  generateLevelMap(chosenStartLevel);
+  rebuild3DBoard();
+  syncLocalCameraToPlayer(true);
+  updateSkyGUI();
+  updateHUD();
+  drawMinimap();
+
+  const hudLevelSelect = document.getElementById('hud-level-select');
+  if (hudLevelSelect) hudLevelSelect.value = String(state.level);
+
+  if (selectedGameMode === 'single') {
+    updateNetStatus('Single Player Mode (South → North)');
+    updateVoiceStatus('Single Player (Voice Off)', false);
+  } else {
+    initMultiplayerPeer(selectedGameMode, state.roomName);
+  }
+
+  if (state.platformMode === 'vr') {
+    await tryStartWebXRSession();
+  } else {
+    showToast('Click any square to create/delete floor! Look UP into the sky for Level Select & Restart.', 'cyan');
+  }
+}
+
+async function tryStartWebXRSession() {
+  if (navigator.xr && navigator.xr.requestSession) {
+    try {
+      const session = await navigator.xr.requestSession('immersive-vr', {
+        optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
+      });
+      renderer.xr.setSession(session);
+      state.vrSessionActive = true;
+      showToast('Oculus Quest WebXR Session Active! Look up anytime for Sky Level GUI.', 'emerald');
+      session.addEventListener('end', () => {
+        state.vrSessionActive = false;
+      });
+      return;
+    } catch (err) {
+      showToast('WebXR Headset not active on this device — running VR Controller + Sky GUI in Browser.', 'amber');
+    }
+  } else {
+    showToast('WebXR not detected — running VR Mode + Sky GUI in Browser.', 'amber');
+  }
+}
+
+function updateHUD() {
+  const localP = getLocalPlayer();
+  const goalRow = state.localPlayerKey === 'p1' ? 0 : (GRID_H - 1);
+  const distRemaining = Math.abs(localP.z - goalRow);
+
+  document.getElementById('hud-level').textContent = `${state.level} / ${state.maxLevels}`;
+  document.getElementById('hud-turns').textContent = state.turnCount;
+  document.getElementById('hud-monsters').textContent = state.monsters.length;
+  document.getElementById('hud-distance').textContent = `${distRemaining} sq`;
+  document.getElementById('hud-role').textContent = state.localPlayerKey === 'p1'
+    ? 'P1 (South → North Goal)'
+    : 'P2 (North → South Goal)';
+  document.getElementById('hud-platform-badge').textContent = state.platformMode === 'vr' ? 'VR Mode' : 'Desktop Mode';
+}
+
+let toastTimeout = null;
+function showToast(msg) {
+  const banner = document.getElementById('toast-banner');
+  if (!banner) return;
+  banner.textContent = msg;
+  banner.classList.remove('hidden');
+  if (toastTimeout) clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => {
+    banner.classList.add('hidden');
+  }, 3400);
+}
+
+function onWindowResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// ============================================================================
+// Main Animation & WebXR Render Loop (Fluid Monster & Player Gliding)
+// ============================================================================
+function renderLoop(timestamp) {
+  const nowMs = timestamp || performance.now();
+
+  if (state.isRunning) {
+    // Fluidly glide cameraRig toward local player's grid square
+    const localP = getLocalPlayer();
+    const targetWorld = gridToWorld(localP.x, localP.z);
+    cameraRig.position.x += (targetWorld.x - cameraRig.position.x) * 0.18;
+    cameraRig.position.z += (targetWorld.z - cameraRig.position.z) * 0.18;
+
+    pollVRControllerThumbsticks(nowMs);
+    updateReticleTarget();
+  }
+
+  // Fluidly glide all monsters from their previous square to their new square with walking stride animation!
+  let idx = 0;
+  monsterMeshes.forEach((group) => {
+    const tx = group.userData.targetX ?? group.position.x;
+    const tz = group.userData.targetZ ?? group.position.z;
+    const dx = tx - group.position.x;
+    const dz = tz - group.position.z;
+    const dist = Math.hypot(dx, dz);
+
+    // Smooth interpolation (fluid movement across squares)
+    group.position.x += dx * 0.14;
+    group.position.z += dz * 0.14;
+
+    // Hop/stride arc when moving between squares, plus idle breathing bob
+    const moveArc = Math.min(1, dist / TILE_SIZE) * Math.abs(Math.sin(nowMs * 0.018)) * 0.45;
+    const idleBob = Math.sin(nowMs * 0.004 + idx * 1.3) * 0.06;
+    group.position.y = moveArc + Math.max(0, idleBob);
+
+    // Smoothly turn monster toward movement direction
+    const targetYaw = group.userData.targetYaw || 0;
+    const yawDiff = Math.atan2(Math.sin(targetYaw - group.rotation.y), Math.cos(targetYaw - group.rotation.y));
+    group.rotation.y += yawDiff * 0.18;
+
+    // Animate clawed arms if Claw Lizard
+    if (group.userData.leftLimb && group.userData.rightLimb) {
+      group.userData.leftLimb.rotation.x = Math.sin(nowMs * 0.008 + idx) * 0.35;
+      group.userData.rightLimb.rotation.x = -Math.sin(nowMs * 0.008 + idx) * 0.35;
+    }
+
+    idx++;
+  });
+
+  renderer.render(scene, camera);
+}
